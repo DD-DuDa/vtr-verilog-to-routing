@@ -241,9 +241,85 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
                                                                   const t_bb& bounding_box,
                                                                   RRNodeId target_node,
                                                                   const t_bb& target_bb) {
-    VTR_ASSERT(bounding_box.layer_max < (int)g_vpr_ctx.device().grid.get_num_layers());
+    VTR_ASSERT(bounding_box.layer_max < g_vpr_ctx.device().grid.get_num_layers());
 
     const RRNodeId& from_node = current.index;
+
+    // 🔍 DEBUG: Print detailed information when from_node is 743
+    if (from_node == RRNodeId(743) && to_node == RRNodeId(873) && target_node == RRNodeId(249)) {
+        printf("\n=== DEBUG: EXPANDING FROM NODE 743 ===\n");
+        
+        // Basic node information
+        printf("From Node: %d\n", (int)from_node);
+        printf("To Node: %d\n", (int)to_node);
+        printf("Target Node: %d (SINK - Final Destination)\n", (int)target_node);
+        printf("From Edge: %d\n", (int)from_edge);
+        
+        // Node types and coordinates
+        auto from_type = this->rr_graph_->node_type(from_node);
+        auto to_type = this->rr_graph_->node_type(to_node);
+        auto target_type = this->rr_graph_->node_type(target_node);
+        
+        printf("From Node Type: %d (%s)\n", (int)from_type, rr_node_typename[from_type]);
+        printf("To Node Type: %d (%s)\n", (int)to_type, rr_node_typename[to_type]);
+        printf("Target Node Type: %d (%s)\n", (int)target_type, rr_node_typename[target_type]);
+        
+        // Track numbers for channel nodes (CHANX/CHANY)
+        if (from_type == e_rr_type::CHANX || from_type == e_rr_type::CHANY) {
+            printf("From Node Track: %d\n", this->rr_graph_->node_track_num(from_node));
+        } else {
+            printf("From Node Track: N/A (not a channel)\n");
+        }
+        
+        if (to_type == e_rr_type::CHANX || to_type == e_rr_type::CHANY) {
+            printf("To Node Track: %d\n", this->rr_graph_->node_track_num(to_node));
+        } else {
+            printf("To Node Track: N/A (not a channel)\n");
+        }
+        
+        // Coordinates with more detail
+        printf("From Node Coords: (%d,%d,%d) to (%d,%d,%d)\n",
+               this->rr_graph_->node_xlow(from_node), this->rr_graph_->node_ylow(from_node), this->rr_graph_->node_layer(from_node),
+               this->rr_graph_->node_xhigh(from_node), this->rr_graph_->node_yhigh(from_node), this->rr_graph_->node_layer(from_node));
+        printf("To Node Coords: (%d,%d,%d) to (%d,%d,%d)\n",
+               this->rr_graph_->node_xlow(to_node), this->rr_graph_->node_ylow(to_node), this->rr_graph_->node_layer(to_node),
+               this->rr_graph_->node_xhigh(to_node), this->rr_graph_->node_yhigh(to_node), this->rr_graph_->node_layer(to_node));
+        printf("Target Node Coords: (%d,%d,%d) to (%d,%d,%d)\n",
+               this->rr_graph_->node_xlow(target_node), this->rr_graph_->node_ylow(target_node), this->rr_graph_->node_layer(target_node),
+               this->rr_graph_->node_xhigh(target_node), this->rr_graph_->node_yhigh(target_node), this->rr_graph_->node_layer(target_node));
+        
+        // Bounding boxes
+        printf("Net Bounding Box: (%d,%d,%d) to (%d,%d,%d)\n",
+               bounding_box.xmin, bounding_box.ymin, bounding_box.layer_min,
+               bounding_box.xmax, bounding_box.ymax, bounding_box.layer_max);
+        printf("Target Bounding Box: (%d,%d,%d) to (%d,%d,%d)\n",
+               target_bb.xmin, target_bb.ymin, target_bb.layer_min,
+               target_bb.xmax, target_bb.ymax, target_bb.layer_max);
+        
+        // Cost parameters
+        printf("Cost Params: criticality=%.3f, pres_fac=%.3f, astar_fac=%.3f\n",
+               cost_params.criticality, cost_params.pres_fac, cost_params.astar_fac);
+        
+        // Current node costs
+        printf("Current backward_path_cost: %.6f\n", current.backward_path_cost);
+        printf("Current R_upstream: %.6f\n", current.R_upstream);
+        
+        // Switch information
+        int iswitch = this->rr_nodes_.edge_switch(from_edge);
+        printf("Switch ID: %d, Buffered: %s, R: %.3f, Tdel: %.3e\n",
+               iswitch, 
+               this->rr_switch_inf_[iswitch].buffered() ? "Yes" : "No",
+               this->rr_switch_inf_[iswitch].R,
+               this->rr_switch_inf_[iswitch].Tdel);
+        
+        // Distance to target
+        int target_x = this->rr_graph_->node_xlow(target_node);
+        int target_y = this->rr_graph_->node_ylow(target_node);
+        int to_x = this->rr_graph_->node_xlow(to_node);
+        int to_y = this->rr_graph_->node_ylow(to_node);
+        int manhattan_dist = abs(to_x - target_x) + abs(to_y - target_y);
+        printf("Manhattan distance from to_node to target: %d\n", manhattan_dist);
+    }
 
     // BB-pruning
     // Disable BB-pruning if RCV is enabled, as this can make it harder for circuits with high negative hold slack to resolve this
@@ -297,14 +373,341 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
     }
 
     VTR_LOGV_DEBUG(this->router_debug_, "      Expanding node %d edge %zu -> %d\n",
-                   from_node, size_t(from_edge), size_t(to_node));
+        from_node, size_t(from_edge), size_t(to_node));
+
+    // === CUSTOM ILLEGAL-PATTERN PRUNING (enable when needed) ===
+    // Set this to true to activate the constraints
+    // printf("Using serial_connection_router.cpp\n"); // we use this for routing
+    static constexpr bool k_enable_track_constraints = true;
+    if (k_enable_track_constraints) {
+        auto ntype = [&](RRNodeId n) { return this->rr_graph_->node_type(n); };
+        auto track = [&](RRNodeId n) { return this->rr_graph_->node_track_num(n); };
+        auto y_of  = [&](RRNodeId n) { return this->rr_graph_->node_ylow(n); };
+        auto x_of  = [&](RRNodeId n) { return this->rr_graph_->node_xlow(n); };
+        auto yh_of = [&](RRNodeId n) { return this->rr_graph_->node_yhigh(n); };
+        auto xh_of = [&](RRNodeId n) { return this->rr_graph_->node_xhigh(n); };
+
+        // Return switch block coordinate (x,y) for an edge which traverses a switch block. switch coordinate: (sx, sy)
+        auto sb_coord = [&](RRNodeId a, RRNodeId b, int& sx, int& sy) -> int {
+            auto ta = ntype(a), tb = ntype(b);
+
+            if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                printf("\n🔄 SB_COORD ANALYSIS for %d → %d:\n", (int)a, (int)b);
+                printf("  Node A: %s at (%d,%d)\n", rr_node_typename[ta], x_of(a), y_of(a));
+                printf("  Node B: %s at (%d,%d)\n", rr_node_typename[tb], x_of(b), y_of(b));
+            }
+
+            // Orthogonal turn
+            if ((ta == e_rr_type::CHANX && tb == e_rr_type::CHANY) || (ta == e_rr_type::CHANY && tb == e_rr_type::CHANX)) {
+                RRNodeId chanx = (ta == e_rr_type::CHANX) ? a : b;
+                RRNodeId chany = (ta == e_rr_type::CHANY) ? a : b;
+                sx = x_of(chany);
+                sy = y_of(chanx);
+
+                if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                    printf("  🔄 ORTHOGONAL TURN detected!\n");
+                    printf("  CHANX node: %d at (%d,%d)\n", (int)chanx, x_of(chanx), y_of(chanx));
+                    printf("  CHANY node: %d at (%d,%d)\n", (int)chany, x_of(chany), y_of(chany));
+                    printf("  Switch Block Coord: (%d,%d)\n", sx, sy);
+                }
+
+                int x_cx = x_of(chanx);
+                int y_cx = y_of(chanx);
+                int x_cy = x_of(chany);
+                int y_cy = y_of(chany);
+
+                if (x_cx == sx + 1 && y_cy == sy + 1) return 1;
+                else if (x_cx == sx && y_cy == sy + 1) return 4;
+                else if (x_cx == sx + 1 && y_cy == sy) return 3;
+                else if (x_cx == sx && y_cy == sy) return 6;
+                
+                printf("  🔄 Invalid switch block coordinate!\n");
+                
+                return 0;
+            }
+
+            // Straight-through across a switch block (same orientation)
+            if (ta == e_rr_type::CHANX && tb == e_rr_type::CHANX) {
+                if (y_of(a) != y_of(b)) return 0;
+                sy = y_of(a);
+
+                int ax = x_of(a);
+                int bx = x_of(b);
+
+                if (ax < bx) sx = ax;
+                else if (ax > bx) sx = bx;
+                else printf("  🔄 Invalid switch block coordinate!\n");
+                
+                if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                    printf("  🔄 STRAIGHT-THROUGH detected!\n");
+                    printf("  CHANX node: %d at (%d,%d)\n", (int)a, x_of(a), y_of(a));
+                    printf("  CHANX node: %d at (%d,%d)\n", (int)b, x_of(b), y_of(b));
+                    printf("  Switch Block Coord: (%d,%d)\n", sx, sy);
+                }
+
+                return 5;
+            }
+
+            if (ta == e_rr_type::CHANY && tb == e_rr_type::CHANY) {
+                if (x_of(a) != x_of(b)) return 0;
+                sx = x_of(a);
+                
+                int ay = y_of(a);
+                int by = y_of(b);
+
+                if (ay < by) sy = ay;
+                else if (ay > by) sy = by;
+                else printf("  🔄 Invalid switch block coordinate!\n");
+
+                if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                    printf("  🔄 STRAIGHT-THROUGH detected!\n");
+                    printf("  CHANY node: %d at (%d,%d)\n", (int)a, x_of(a), y_of(a));
+                    printf("  CHANY node: %d at (%d,%d)\n", (int)b, x_of(b), y_of(b));
+                    printf("  Switch Block Coord: (%d,%d)\n", sx, sy);
+                }
+
+                return 2;
+            }
+
+            return 0;
+        };
+
+        
+
+        // --- One-track-per-switch-block rule ---
+        if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+            printf("🔄 One-track-per-switch-block rule\n");
+        }
+        
+        enum : int {
+            X_AT_SX  = 1 << 0,
+            X_AT_SX1 = 1 << 1,
+            Y_AT_SY  = 1 << 2,
+            Y_AT_SY1 = 1 << 3
+        };
+
+        auto sb_side_mask = [&](RRNodeId n, int sx, int sy) -> int {
+            auto t = ntype(n);
+            int x = this->rr_graph_->node_xlow(n);
+            int y = this->rr_graph_->node_ylow(n);
+
+            int m = 0;
+            if (t == e_rr_type::CHANX) {
+                if (y == sy) {
+                    if (x == sx)     m |= X_AT_SX;
+                    if (x == sx + 1) m |= X_AT_SX1;
+                }
+            } else if (t == e_rr_type::CHANY) {
+                if (y == sy)       m |= Y_AT_SY;
+                if (y == sy + 1)   m |= Y_AT_SY1;
+            }
+            return m;
+        };
+
+        bool forbid = false;
+
+        // Sides already used at this SB/track by any routed net (based on occ)
+        auto sb_used_mask_by_occ = [&](int layer, int sx, int sy, int tr) -> int {
+            int m = 0;
+            const auto& lookup = this->rr_graph_->node_lookup();
+            
+            if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                printf("\n🚦 SB_USED_MASK_BY_OCC DETAILED ANALYSIS:\n");
+                printf("  Switch Block: (%d,%d) on layer %d\n", sx, sy, layer);
+                printf("  Target Track: %d\n", tr);
+                printf("  Searching for occupied nodes...\n");
+            }
+            
+            // CHANX touching (sx,sy) at y==sy, x in {sx,sx+1}
+            if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                printf("\n  🔍 SEARCHING CHANX NODES:\n");
+                printf("    Looking at y=%d, x in {%d,%d}\n", sy, sx, sx+1);
+            }
+            
+            for (int cx = sx; cx <= sx + 1; ++cx) {
+                auto chanx_nodes = lookup.find_channel_nodes(layer, cx, sy, e_rr_type::CHANX);
+                
+                if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                    printf("    At position (%d,%d): Found %zu CHANX nodes\n", cx, sy, chanx_nodes.size());
+                }
+                
+                for (RRNodeId n : chanx_nodes) {
+                    int node_track = this->rr_graph_->node_track_num(n);
+                    int node_occ = this->rr_node_route_inf_[n].occ();
+                    int node_cap = this->rr_graph_->node_capacity(n);
+                    
+                    if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                        printf("      Node %d: track=%d, occ=%d/%d", (int)n, node_track, node_occ, node_cap);
+                    }
+                    
+                    if (node_track == tr && node_occ > 0) {
+                        int side_mask = sb_side_mask(n, sx, sy);
+                        m |= side_mask;
+                        
+                        if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                            printf(" → OCCUPIED! side_mask=%d", side_mask);
+                            printf("\n        Node bounds: (%d,%d) to (%d,%d)",
+                                this->rr_graph_->node_xlow(n), this->rr_graph_->node_ylow(n),
+                                this->rr_graph_->node_xhigh(n), this->rr_graph_->node_yhigh(n));
+                            printf("\n        Contributes to mask: %s%s%s%s",
+                                (side_mask & X_AT_SX) ? "X_AT_SX " : "",
+                                (side_mask & X_AT_SX1) ? "X_AT_SX1 " : "",
+                                (side_mask & Y_AT_SY) ? "Y_AT_SY " : "",
+                                (side_mask & Y_AT_SY1) ? "Y_AT_SY1 " : "");
+                        }
+                    }
+                    
+                    if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                        printf("\n");
+                    }
+                }
+            }
+            
+            // CHANY touching (sx,sy) at x in {sx,sx+1}, y passes sy
+            if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                printf("\n  🔍 SEARCHING CHANY NODES:\n");
+                printf("    Looking at x in {%d,%d}, y passes %d\n", sx, sx+1, sy);
+            }
+            
+            // for (int cx = sx; cx <= sx + 1; ++cx) {
+
+            for (int cy = sy; cy <= sy + 1; ++cy) {
+                auto chany_nodes = lookup.find_channel_nodes(layer, sx, cy, e_rr_type::CHANY);
+                
+                if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                    printf("    At y=%d: Found %zu CHANY nodes\n", cy, chany_nodes.size());
+                }
+                
+                for (RRNodeId n : chany_nodes) {
+                    int node_track = this->rr_graph_->node_track_num(n);
+                    int node_occ = this->rr_node_route_inf_[n].occ();
+                    int node_cap = this->rr_graph_->node_capacity(n);
+                    
+                    if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                        printf("      Node %d: track=%d, occ=%d/%d", (int)n, node_track, node_occ, node_cap);
+                    }
+                    
+                    if (node_track == tr && node_occ > 0) {
+                        int side_mask = sb_side_mask(n, sx, sy);
+                        m |= side_mask;
+                        
+                        if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                            printf(" → OCCUPIED! side_mask=%d", side_mask);
+                            printf("\n        Node bounds: (%d,%d) to (%d,%d)",
+                                this->rr_graph_->node_xlow(n), this->rr_graph_->node_ylow(n),
+                                this->rr_graph_->node_xhigh(n), this->rr_graph_->node_yhigh(n));
+                            printf("\n        Contributes to mask: %s%s%s%s",
+                                (side_mask & X_AT_SX) ? "X_AT_SX " : "",
+                                (side_mask & X_AT_SX1) ? "X_AT_SX1 " : "",
+                                (side_mask & Y_AT_SY) ? "Y_AT_SY " : "",
+                                (side_mask & Y_AT_SY1) ? "Y_AT_SY1 " : "");
+                        }
+                    }
+                    
+                    if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                        printf("\n");
+                    }
+                }
+            }
+            
+            if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+                printf("\n  📊 FINAL OCCUPANCY SUMMARY:\n");
+                printf("    Total used mask: %d (binary: ", m);
+                for (int i = 3; i >= 0; i--) {
+                    printf("%d", (m >> i) & 1);
+                }
+                printf(")\n");
+                printf("    Interpretation:\n");
+                if (m & X_AT_SX)  printf("      ✓ X_AT_SX (horizontal wire at x=%d)\n", sx);
+                if (m & X_AT_SX1) printf("      ✓ X_AT_SX1 (horizontal wire at x=%d)\n", sx+1);
+                if (m & Y_AT_SY)  printf("      ✓ Y_AT_SY (vertical wire at x=%d)\n", sx);
+                if (m & Y_AT_SY1) printf("      ✓ Y_AT_SY1 (vertical wire at x=%d)\n", sx+1);
+                if (m == 0) printf("      ✓ No occupied sides on track %d\n", tr);
+                printf("    🚧 Rule: Only ONE track can use each side of switch block!\n");
+            }
+            
+            return m;
+        };
+
+        if (!forbid && current.prev_edge != RREdgeId::INVALID() && (ntype(from_node) == e_rr_type::CHANX || ntype(from_node) == e_rr_type::CHANY)) {
+            int layer = this->rr_graph_->node_layer(from_node);
+            int track_from_node = track(from_node);
+
+            /* Prune the case when clb connects to the left switch */
+            if (ntype(from_node) == e_rr_type::CHANX && x_of(to_node) == x_of(from_node) - 1) {
+                int used_occ = sb_used_mask_by_occ(layer, x_of(from_node), y_of(from_node), track_from_node);
+                if ((used_occ & (Y_AT_SY1 | X_AT_SX1)) || (used_occ & (Y_AT_SY1 | Y_AT_SY)) || (used_occ & (Y_AT_SY | X_AT_SX1))) {
+                    forbid = true;
+                }
+            } else if (ntype(to_node) == e_rr_type::CHANX && x_of(to_node) == x_of(from_node) + 1) {
+                int used_occ = sb_used_mask_by_occ(layer, x_of(to_node), y_of(to_node), track_from_node);
+                if ((used_occ & (Y_AT_SY1 | X_AT_SX1)) || (used_occ & (Y_AT_SY1 | Y_AT_SY)) || (used_occ & (Y_AT_SY | X_AT_SX1))) {
+                    forbid = true;
+                }
+            }
+
+            /* Prune the case when multi-track routing to the same switch */
+            RRNodeId grandparent = this->rr_graph_->edge_src_node(current.prev_edge);
+            int sx1 = 0, sy1 = 0;
+            int sx2 = 0, sy2 = 0;
+            int sb_type1 = sb_coord(from_node, to_node, sx1, sy1);
+            int sb_type2 = sb_coord(grandparent, from_node, sx2, sy2);
+
+            if (sb_type1 > 0) {
+                int used_occ = sb_used_mask_by_occ(layer, sx1, sy1, track_from_node);
+                if (sb_type1 < 4) {
+                    if ((used_occ & X_AT_SX)) {
+                        forbid = true;
+                    }
+                } else if (sb_type1 > 4 && sb_type1 < 6) {
+                    if ((used_occ & Y_AT_SY)) {
+                        forbid = true;
+                    }
+                } else if (sb_type1 == 6) {
+                    if ((used_occ & Y_AT_SY1)) {
+                        forbid = true;
+                    }
+                }
+            }
+
+            if (sb_type2 > 0) {
+                int used_occ = sb_used_mask_by_occ(layer, sx2, sy2, track_from_node);
+                if (sb_type2 < 4) {
+                    if ((used_occ & X_AT_SX)) {
+                        forbid = true;
+                    }
+                }
+                else if (sb_type2 >= 4 && sb_type2 < 6) {
+                    if ((used_occ & Y_AT_SY)) {
+                        forbid = true;
+                    }
+                } else if (sb_type2 == 6) {
+                    if ((used_occ & Y_AT_SY1)) {
+                        forbid = true;
+                    }
+                }
+            }
+
+        }
+
+        if (forbid) {
+            VTR_LOGV_DEBUG(this->router_debug_,
+                            "      Pruned by custom track constraints: %d -> %d -> %d\n",
+                            (int)this->rr_graph_->edge_src_node(current.prev_edge), (int)from_node, (int)to_node);
+            // printf("Pruned by custom track constraints: %d -> %d -> %d\n",
+            //                 (int)this->rr_graph_->edge_src_node(current.prev_edge), (int)from_node, (int)to_node);
+            return;
+        }
+    }
+    
+    // === END CUSTOM PRUNING ===
 
     // Check if the node exists in the route tree when RCV is enabled
     // Other pruning methods have been disabled when RCV is on, so this method is required to prevent "loops" from being created
     bool node_exists = false;
     if (this->rcv_path_manager.is_enabled()) {
-        node_exists = this->rcv_path_manager.node_exists_in_tree(this->rcv_path_data[from_node],
-                                                                 to_node);
+    node_exists = this->rcv_path_manager.node_exists_in_tree(this->rcv_path_data[from_node],
+                                                        to_node);
     }
 
     if (!node_exists || !this->rcv_path_manager.is_enabled()) {
@@ -314,7 +717,12 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
                                   from_edge,
                                   target_node);
     }
+
+    if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
+        printf("Node 1535: Adding to heap: %d -> %d\n", from_node, to_node);
+    }
 }
+    
 
 template<typename Heap>
 void SerialConnectionRouter<Heap>::timing_driven_add_to_heap(const t_conn_cost_params& cost_params,
@@ -465,8 +873,7 @@ std::unique_ptr<ConnectionRouterInterface> make_serial_connection_router(e_heap_
                                                                          const std::vector<t_rr_rc_data>& rr_rc_data,
                                                                          const vtr::vector<RRSwitchId, t_rr_switch_inf>& rr_switch_inf,
                                                                          vtr::vector<RRNodeId, t_rr_node_route_inf>& rr_node_route_inf,
-                                                                         bool is_flat,
-                                                                         int route_verbosity) {
+                                                                         bool is_flat) {
     switch (heap_type) {
         case e_heap_type::BINARY_HEAP:
             return std::make_unique<SerialConnectionRouter<BinaryHeap>>(
@@ -477,8 +884,7 @@ std::unique_ptr<ConnectionRouterInterface> make_serial_connection_router(e_heap_
                 rr_rc_data,
                 rr_switch_inf,
                 rr_node_route_inf,
-                is_flat,
-                route_verbosity);
+                is_flat);
         case e_heap_type::FOUR_ARY_HEAP:
             return std::make_unique<SerialConnectionRouter<FourAryHeap>>(
                 grid,
@@ -488,8 +894,7 @@ std::unique_ptr<ConnectionRouterInterface> make_serial_connection_router(e_heap_
                 rr_rc_data,
                 rr_switch_inf,
                 rr_node_route_inf,
-                is_flat,
-                route_verbosity);
+                is_flat);
         default:
             VPR_FATAL_ERROR(VPR_ERROR_ROUTE, "Unknown heap_type %d",
                             heap_type);
