@@ -241,85 +241,9 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
                                                                   const t_bb& bounding_box,
                                                                   RRNodeId target_node,
                                                                   const t_bb& target_bb) {
-    VTR_ASSERT(bounding_box.layer_max < g_vpr_ctx.device().grid.get_num_layers());
+    VTR_ASSERT(bounding_box.layer_max < (int)g_vpr_ctx.device().grid.get_num_layers());
 
     const RRNodeId& from_node = current.index;
-
-    // 🔍 DEBUG: Print detailed information when from_node is 743
-    if (from_node == RRNodeId(743) && to_node == RRNodeId(873) && target_node == RRNodeId(249)) {
-        printf("\n=== DEBUG: EXPANDING FROM NODE 743 ===\n");
-        
-        // Basic node information
-        printf("From Node: %d\n", (int)from_node);
-        printf("To Node: %d\n", (int)to_node);
-        printf("Target Node: %d (SINK - Final Destination)\n", (int)target_node);
-        printf("From Edge: %d\n", (int)from_edge);
-        
-        // Node types and coordinates
-        auto from_type = this->rr_graph_->node_type(from_node);
-        auto to_type = this->rr_graph_->node_type(to_node);
-        auto target_type = this->rr_graph_->node_type(target_node);
-        
-        printf("From Node Type: %d (%s)\n", (int)from_type, rr_node_typename[from_type]);
-        printf("To Node Type: %d (%s)\n", (int)to_type, rr_node_typename[to_type]);
-        printf("Target Node Type: %d (%s)\n", (int)target_type, rr_node_typename[target_type]);
-        
-        // Track numbers for channel nodes (CHANX/CHANY)
-        if (from_type == e_rr_type::CHANX || from_type == e_rr_type::CHANY) {
-            printf("From Node Track: %d\n", this->rr_graph_->node_track_num(from_node));
-        } else {
-            printf("From Node Track: N/A (not a channel)\n");
-        }
-        
-        if (to_type == e_rr_type::CHANX || to_type == e_rr_type::CHANY) {
-            printf("To Node Track: %d\n", this->rr_graph_->node_track_num(to_node));
-        } else {
-            printf("To Node Track: N/A (not a channel)\n");
-        }
-        
-        // Coordinates with more detail
-        printf("From Node Coords: (%d,%d,%d) to (%d,%d,%d)\n",
-               this->rr_graph_->node_xlow(from_node), this->rr_graph_->node_ylow(from_node), this->rr_graph_->node_layer(from_node),
-               this->rr_graph_->node_xhigh(from_node), this->rr_graph_->node_yhigh(from_node), this->rr_graph_->node_layer(from_node));
-        printf("To Node Coords: (%d,%d,%d) to (%d,%d,%d)\n",
-               this->rr_graph_->node_xlow(to_node), this->rr_graph_->node_ylow(to_node), this->rr_graph_->node_layer(to_node),
-               this->rr_graph_->node_xhigh(to_node), this->rr_graph_->node_yhigh(to_node), this->rr_graph_->node_layer(to_node));
-        printf("Target Node Coords: (%d,%d,%d) to (%d,%d,%d)\n",
-               this->rr_graph_->node_xlow(target_node), this->rr_graph_->node_ylow(target_node), this->rr_graph_->node_layer(target_node),
-               this->rr_graph_->node_xhigh(target_node), this->rr_graph_->node_yhigh(target_node), this->rr_graph_->node_layer(target_node));
-        
-        // Bounding boxes
-        printf("Net Bounding Box: (%d,%d,%d) to (%d,%d,%d)\n",
-               bounding_box.xmin, bounding_box.ymin, bounding_box.layer_min,
-               bounding_box.xmax, bounding_box.ymax, bounding_box.layer_max);
-        printf("Target Bounding Box: (%d,%d,%d) to (%d,%d,%d)\n",
-               target_bb.xmin, target_bb.ymin, target_bb.layer_min,
-               target_bb.xmax, target_bb.ymax, target_bb.layer_max);
-        
-        // Cost parameters
-        printf("Cost Params: criticality=%.3f, pres_fac=%.3f, astar_fac=%.3f\n",
-               cost_params.criticality, cost_params.pres_fac, cost_params.astar_fac);
-        
-        // Current node costs
-        printf("Current backward_path_cost: %.6f\n", current.backward_path_cost);
-        printf("Current R_upstream: %.6f\n", current.R_upstream);
-        
-        // Switch information
-        int iswitch = this->rr_nodes_.edge_switch(from_edge);
-        printf("Switch ID: %d, Buffered: %s, R: %.3f, Tdel: %.3e\n",
-               iswitch, 
-               this->rr_switch_inf_[iswitch].buffered() ? "Yes" : "No",
-               this->rr_switch_inf_[iswitch].R,
-               this->rr_switch_inf_[iswitch].Tdel);
-        
-        // Distance to target
-        int target_x = this->rr_graph_->node_xlow(target_node);
-        int target_y = this->rr_graph_->node_ylow(target_node);
-        int to_x = this->rr_graph_->node_xlow(to_node);
-        int to_y = this->rr_graph_->node_ylow(to_node);
-        int manhattan_dist = abs(to_x - target_x) + abs(to_y - target_y);
-        printf("Manhattan distance from to_node to target: %d\n", manhattan_dist);
-    }
 
     // BB-pruning
     // Disable BB-pruning if RCV is enabled, as this can make it harder for circuits with high negative hold slack to resolve this
@@ -373,7 +297,7 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
     }
 
     VTR_LOGV_DEBUG(this->router_debug_, "      Expanding node %d edge %zu -> %d\n",
-        from_node, size_t(from_edge), size_t(to_node));
+                   from_node, size_t(from_edge), size_t(to_node));
 
     // === CUSTOM ILLEGAL-PATTERN PRUNING (enable when needed) ===
     // Set this to true to activate the constraints
@@ -706,8 +630,8 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
     // Other pruning methods have been disabled when RCV is on, so this method is required to prevent "loops" from being created
     bool node_exists = false;
     if (this->rcv_path_manager.is_enabled()) {
-    node_exists = this->rcv_path_manager.node_exists_in_tree(this->rcv_path_data[from_node],
-                                                        to_node);
+        node_exists = this->rcv_path_manager.node_exists_in_tree(this->rcv_path_data[from_node],
+                                                                 to_node);
     }
 
     if (!node_exists || !this->rcv_path_manager.is_enabled()) {
@@ -717,12 +641,7 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
                                   from_edge,
                                   target_node);
     }
-
-    if (from_node == RRNodeId(995) && to_node == RRNodeId(1515) && target_node == RRNodeId(193)) {
-        printf("Node 1535: Adding to heap: %d -> %d\n", from_node, to_node);
-    }
 }
-    
 
 template<typename Heap>
 void SerialConnectionRouter<Heap>::timing_driven_add_to_heap(const t_conn_cost_params& cost_params,
@@ -873,7 +792,8 @@ std::unique_ptr<ConnectionRouterInterface> make_serial_connection_router(e_heap_
                                                                          const std::vector<t_rr_rc_data>& rr_rc_data,
                                                                          const vtr::vector<RRSwitchId, t_rr_switch_inf>& rr_switch_inf,
                                                                          vtr::vector<RRNodeId, t_rr_node_route_inf>& rr_node_route_inf,
-                                                                         bool is_flat) {
+                                                                         bool is_flat,
+                                                                         int route_verbosity) {
     switch (heap_type) {
         case e_heap_type::BINARY_HEAP:
             return std::make_unique<SerialConnectionRouter<BinaryHeap>>(
@@ -884,7 +804,8 @@ std::unique_ptr<ConnectionRouterInterface> make_serial_connection_router(e_heap_
                 rr_rc_data,
                 rr_switch_inf,
                 rr_node_route_inf,
-                is_flat);
+                is_flat,
+                route_verbosity);
         case e_heap_type::FOUR_ARY_HEAP:
             return std::make_unique<SerialConnectionRouter<FourAryHeap>>(
                 grid,
@@ -894,7 +815,8 @@ std::unique_ptr<ConnectionRouterInterface> make_serial_connection_router(e_heap_
                 rr_rc_data,
                 rr_switch_inf,
                 rr_node_route_inf,
-                is_flat);
+                is_flat,
+                route_verbosity);
         default:
             VPR_FATAL_ERROR(VPR_ERROR_ROUTE, "Unknown heap_type %d",
                             heap_type);
