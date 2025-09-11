@@ -68,6 +68,13 @@ bool route(const Netlist<>& net_list,
     //Initialize drawing, now that we have an RR graph
     init_draw_coords(width_fac, g_vpr_ctx.placement().blk_loc_registry());
 
+    // Early exit if we only need to write the RR graph
+    if (!det_routing_arch.write_rr_graph_filename.empty()) {
+        VTR_LOG("RR graph written to %s. Exiting early as requested.\n", 
+                det_routing_arch.write_rr_graph_filename.c_str());
+        return true; // Return success without performing routing
+    }
+    
     /* Allocate and load additional rr_graph information needed only by the router. */
     alloc_and_load_rr_node_route_structs(router_opts);
 
