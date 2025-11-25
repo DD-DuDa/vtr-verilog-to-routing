@@ -6,6 +6,7 @@
 #include <sstream>
 #include <map>
 #include <string_view>
+#include <fstream>
 
 #include "atom_lookup.h"
 #include "atom_netlist.h"
@@ -13,11 +14,13 @@
 #include "physical_types_util.h"
 #include "vtr_assert.h"
 #include "vtr_util.h"
+#include "vtr_log.h"
 #include "vpr_utils.h"
 #include "vpr_types.h"
 #include "vpr_error.h"
 #include "physical_types.h"
 #include "echo_files.h"
+#include "pugixml.hpp"
 
 /**
  * @brief Determines whether a cluster net is constant.
@@ -97,7 +100,8 @@ PlaceMacros::PlaceMacros(const std::vector<t_direct_inf>& directs,
                          const std::vector<t_physical_tile_type>& physical_tile_types,
                          const ClusteredNetlist& clb_nlist,
                          const AtomNetlist& atom_nlist,
-                         const AtomLookup& atom_lookup) {
+                         const AtomLookup& atom_lookup,
+                         const std::string& macro_constraints_file) {
     /* Allocates allocates and loads placement macros and returns
      * the total number of macros in 2 steps.
      *   1) Allocate temporary data structure for maximum possible
@@ -154,6 +158,11 @@ PlaceMacros::PlaceMacros(const std::vector<t_direct_inf>& directs,
                             pl_macros_,
                             physical_tile_types,
                             clb_nlist);
+    }
+
+    // Load custom macros from XML constraints file if provided
+    if (!macro_constraints_file.empty()) {
+        load_custom_macros_from_xml_(macro_constraints_file, clb_nlist);
     }
 
     validate_macros(pl_macros_, clb_nlist);
@@ -702,4 +711,104 @@ static void validate_macros(const std::vector<t_pl_macro>& macros,
             VPR_FATAL_ERROR(VPR_ERROR_PLACE, msg.str().c_str());
         }
     }
+}
+
+void PlaceMacros::load_custom_macros_from_xml_(const std::string& macro_constraints_file,
+                                               const ClusteredNetlist& clb_nlist) {
+    // Check if file exists
+    std::ifstream file_check(macro_constraints_file);
+    if (!file_check.good()) {
+        VTR_LOG_WARN("Macro constraints file '%s' not found. Skipping custom macro loading.\n",
+                     macro_constraints_file.c_str());
+        return;
+    }
+    file_check.close();
+
+    VTR_LOG("Loading custom placement macros from '%s'\n", macro_constraints_file.c_str());
+
+    // Parse the XML file
+    pugi::xml_document doc;
+    pugi::xml_parse_result result = doc.load_file(macro_constraints_file.c_str());
+    
+    if (!result) {
+        VTR_LOG_ERROR("Failed to parse macro constraints XML file '%s': %s\n",
+                      macro_constraints_file.c_str(), result.description());
+        return;
+    }
+
+    // Build block name to ID map
+    std::map<std::string, ClusterBlockId> block_name_to_id;
+    for (ClusterBlockId blk_id : clb_nlist.blocks()) {
+        block_name_to_id[clb_nlist.block_name(blk_id)] = blk_id;
+    }
+
+    // Navigate to macro_list
+    pugi::xml_node root = doc.child("vpr_macro_constraints");
+    if (!root) {
+        VTR_LOG_WARN("No <vpr_macro_constraints> root element found in '%s'\n",
+                     macro_constraints_file.c_str());
+        return;
+    }
+
+    pugi::xml_node macro_list = root.child("macro_list");
+    if (!macro_list) {
+        VTR_LOG_WARN("No <macro_list> element found in '%s'\n",
+                     macro_constraints_file.c_str());
+        return;
+    }
+
+    int loaded_count = 0;
+    int skipped_count = 0;
+
+    // Process each placement_macro
+    for (pugi::xml_node macro_node : macro_list.children("placement_macro")) {
+        std::string macro_name = macro_node.attribute("name").as_string("");
+        
+        t_pl_macro new_macro;
+        bool all_blocks_found = true;
+
+        // Process each member
+        for (pugi::xml_node member_node : macro_node.children("member")) {
+            std::string block_name = member_node.attribute("block_name").as_string("");
+            int x_offset = member_node.attribute("x_offset").as_int(0);
+            int y_offset = member_node.attribute("y_offset").as_int(0);
+
+            // Look up the block ID
+            auto it = block_name_to_id.find(block_name);
+            if (it == block_name_to_id.end()) {
+                VTR_LOG_WARN("Block '%s' in macro '%s' not found in netlist. Skipping this macro.\n",
+                             block_name.c_str(), macro_name.c_str());
+                all_blocks_found = false;
+                break;
+            }
+
+            // Check if this block is already part of another macro
+            ClusterBlockId blk_id = it->second;
+            if (blk_id < ClusterBlockId(imacro_from_iblk_.size()) && 
+                imacro_from_iblk_[blk_id] != UNDEFINED) {
+                VTR_LOG_WARN("Block '%s' is already part of macro %d. Skipping macro '%s'.\n",
+                             block_name.c_str(), imacro_from_iblk_[blk_id], macro_name.c_str());
+                all_blocks_found = false;
+                break;
+            }
+
+            t_pl_macro_member member;
+            member.blk_index = blk_id;
+            member.offset = t_pl_offset(x_offset, y_offset, 0, 0);
+            new_macro.members.push_back(member);
+        }
+
+        // Only add the macro if all blocks were found
+        if (all_blocks_found && !new_macro.members.empty()) {
+            pl_macros_.push_back(new_macro);
+            loaded_count++;
+            VTR_LOG("  Loaded macro '%s' with %zu members\n", 
+                    macro_name.c_str(), new_macro.members.size());
+        } else {
+            skipped_count++;
+        }
+    }
+
+    VTR_LOG("Custom macro loading complete: %d macros loaded, %d skipped\n",
+            loaded_count, skipped_count);
 }

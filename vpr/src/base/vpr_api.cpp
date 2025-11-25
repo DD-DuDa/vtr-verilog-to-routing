@@ -916,7 +916,8 @@ void vpr_load_placement(t_vpr_setup& vpr_setup,
                                                            device_ctx.physical_tile_types,
                                                            g_vpr_ctx.clustering().clb_nlist,
                                                            g_vpr_ctx.atom().netlist(),
-                                                           g_vpr_ctx.atom().lookup());
+                                                           g_vpr_ctx.atom().lookup(),
+                                                           vpr_setup.PlacerOpts.macro_constraints_file);
 
     // Load an existing placement from a file
     place_ctx.placement_id = read_place(filename_opts.NetFile.c_str(), filename_opts.PlaceFile.c_str(),

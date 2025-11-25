@@ -1033,6 +1033,7 @@ struct t_placer_opts {
     int place_chan_width;
     enum e_pad_loc_type pad_loc_type;
     std::string constraints_file;
+    std::string macro_constraints_file;  ///<File containing custom placement macro definitions (2D shape constraints)
     std::string write_initial_place_file;
     std::string read_initial_place_file;
     enum pfreq place_freq;

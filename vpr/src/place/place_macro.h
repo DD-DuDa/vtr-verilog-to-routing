@@ -118,6 +118,7 @@
  ****************************************************************************************/
 
 #include <vector>
+#include <string>
 
 #include "clustered_netlist_fwd.h"
 #include "physical_types.h"
@@ -165,7 +166,8 @@ class PlaceMacros {
                 const std::vector<t_physical_tile_type>& physical_tile_types,
                 const ClusteredNetlist& clb_nlist,
                 const AtomNetlist& atom_nlist,
-                const AtomLookup& atom_lookup);
+                const AtomLookup& atom_lookup,
+                const std::string& macro_constraints_file = "");
 
     /**
      * @brief Returns the placement macro index to which the given block belongs.
@@ -260,4 +262,28 @@ class PlaceMacros {
      */
     void alloc_and_load_idirect_from_blk_pin_(const std::vector<t_direct_inf>& directs,
                                               const std::vector<t_physical_tile_type>& physical_tile_types);
+
+    /**
+     * @brief Loads custom placement macros from an XML constraints file.
+     *
+     * @details This allows users to define custom 2D macro shapes (e.g., 3x3 grids)
+     * for groups of blocks. VPR will place these macros as a unit while maintaining
+     * the relative positions defined in the constraints file.
+     *
+     * The XML format is:
+     * <vpr_macro_constraints>
+     *   <macro_list>
+     *     <placement_macro name="op_name">
+     *       <member block_name="PE0" x_offset="0" y_offset="0"/>
+     *       <member block_name="PE1" x_offset="1" y_offset="0"/>
+     *       ...
+     *     </placement_macro>
+     *   </macro_list>
+     * </vpr_macro_constraints>
+     *
+     * @param macro_constraints_file Path to the XML file containing macro definitions.
+     * @param clb_nlist The clustered netlist to look up block IDs.
+     */
+    void load_custom_macros_from_xml_(const std::string& macro_constraints_file,
+                                      const ClusteredNetlist& clb_nlist);
 };

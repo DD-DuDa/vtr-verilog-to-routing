@@ -663,6 +663,7 @@ static void setup_placer_opts(const t_options& Options, t_placer_opts* PlacerOpt
     PlacerOpts->place_quench_algorithm = Options.PlaceQuenchAlgorithm;
 
     PlacerOpts->constraints_file = Options.constraints_file;
+    PlacerOpts->macro_constraints_file = Options.macro_constraints_file;
 
     PlacerOpts->write_initial_place_file = Options.write_initial_place_file;
 

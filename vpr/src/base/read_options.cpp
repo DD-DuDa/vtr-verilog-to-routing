@@ -2306,6 +2306,15 @@ argparse::ArgumentParser create_arg_parser(const std::string& prog_name, t_optio
         .default_value("")
         .show_in(argparse::ShowIn::HELP_ONLY);
 
+    place_grp.add_argument(args.macro_constraints_file, "--macro_constraints")
+        .help(
+            "Specifies a file containing custom placement macro definitions.\n"
+            "Macros define groups of blocks that must maintain fixed relative positions during placement.\n"
+            "This allows defining 2D shapes (e.g., 3x3 grids) for groups of blocks.\n"
+            "The file should be in XML format with <placement_macro> elements specifying members and offsets.")
+        .default_value("")
+        .show_in(argparse::ShowIn::HELP_ONLY);
+
     place_grp.add_argument<e_place_algorithm, ParsePlaceAlgorithm>(args.PlaceAlgorithm, "--place_algorithm")
         .help(
             "Controls which placement algorithm is used. Valid options:\n"

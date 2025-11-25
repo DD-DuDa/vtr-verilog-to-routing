@@ -67,7 +67,8 @@ void PlacementContext::init_placement_context(const t_placer_opts& placer_opts,
                                                  device_ctx.physical_tile_types,
                                                  cluster_ctx.clb_nlist,
                                                  atom_ctx.netlist(),
-                                                 atom_ctx.lookup());
+                                                 atom_ctx.lookup(),
+                                                 placer_opts.macro_constraints_file);
 }
 
 static bool is_cube_bb(const e_place_bounding_box_mode place_bb_mode,

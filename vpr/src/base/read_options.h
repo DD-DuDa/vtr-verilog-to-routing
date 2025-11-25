@@ -27,6 +27,7 @@ struct t_options {
 
     argparse::ArgValue<std::string> out_file_prefix;
     argparse::ArgValue<std::string> constraints_file;
+    argparse::ArgValue<std::string> macro_constraints_file;
     argparse::ArgValue<std::string> write_rr_graph_file;
     argparse::ArgValue<std::string> read_rr_graph_file;
     argparse::ArgValue<std::string> read_rr_edge_override_file;
