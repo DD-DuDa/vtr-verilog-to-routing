@@ -626,6 +626,111 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
     
     // === END CUSTOM PRUNING ===
 
+    // === MULTI-FANOUT SAME-TRACK CONSTRAINT ===
+    // Force multiple fanout branches from the same OPIN to use the same initial track
+    // With track group relaxation: allow creating new track groups when single-track routing fails
+    if (k_enable_track_constraints) {
+        auto ntype = [&](RRNodeId n) { return this->rr_graph_->node_type(n); };
+        auto track = [&](RRNodeId n) { return this->rr_graph_->node_track_num(n); };
+
+        if (ntype(from_node) == e_rr_type::OPIN &&
+            (ntype(to_node) == e_rr_type::CHANX || ntype(to_node) == e_rr_type::CHANY)) {
+
+            int to_track = track(to_node);
+
+            // Check if this track is blacklisted for this OPIN
+            if (this->conn_params_) {
+                auto it = this->conn_params_->blacklisted_tracks_.find(from_node);
+                if (it != this->conn_params_->blacklisted_tracks_.end()) {
+                    const auto& blacklisted = it->second;
+                    if (blacklisted.find(to_track) != blacklisted.end()) {
+                        VTR_LOGV_DEBUG(this->router_debug_,
+                                      "      Pruned expansion: OPIN %d track %d is blacklisted\n",
+                                      size_t(from_node), to_track);
+                        return; // Prune this edge - blacklisted track!
+                    }
+                }
+
+                // === TRACK GROUP RELAXATION ===
+                // When allow_new_track_group_ is true, we're creating a new track group
+                // In this mode, we must NOT use tracks from existing groups (forces new branch)
+                if (this->conn_params_->allow_new_track_group_) {
+                    auto existing_it = this->conn_params_->existing_opin_tracks_.find(from_node);
+                    if (existing_it != this->conn_params_->existing_opin_tracks_.end()) {
+                        const auto& existing_tracks = existing_it->second;
+                        if (existing_tracks.find(to_track) != existing_tracks.end()) {
+                            VTR_LOGV_DEBUG(this->router_debug_,
+                                          "      Pruned expansion: OPIN %d track %d is used by existing track group, "
+                                          "must use new track for new group\n",
+                                          size_t(from_node), to_track);
+                            return; // Prune - must use a NEW track for new track group
+                        }
+                    }
+                    // In relaxed mode, allow any track not in existing groups
+                    // Skip the normal same-track constraint below
+                    VTR_LOGV_DEBUG(this->router_debug_,
+                                  "      Track group relaxation: allowing OPIN %d to use new track %d\n",
+                                  size_t(from_node), to_track);
+                }
+                // === END TRACK GROUP RELAXATION ===
+            }
+
+            // Get the current net's route tree to check if this OPIN already has routing
+            auto& route_ctx = g_vpr_ctx.routing();
+            if (this->conn_params_ && this->conn_params_->net_id_ != ParentNetId::INVALID()) {
+                ParentNetId net_id = this->conn_params_->net_id_;
+
+                // Skip same-track enforcement if we're in track group relaxation mode
+                if (this->conn_params_->allow_new_track_group_) {
+                    // Relaxation mode: allow different tracks from existing children
+                    // The existing_opin_tracks_ check above already prevents reusing old tracks
+                } else if (route_ctx.route_trees[net_id]) {
+                    const RouteTree& tree = route_ctx.route_trees[net_id].value();
+
+                    // Find if this OPIN exists in the route tree (returns optional<const RouteTreeNode&>)
+                    auto opin_node_opt = tree.find_by_rr_id(from_node);
+
+                    if (opin_node_opt) {
+                        const RouteTreeNode& opin_node = opin_node_opt.value();
+
+                        // Check if this OPIN has children by iterating (no empty() method)
+                        bool has_children = false;
+                        int first_child_track = -1;
+                        e_rr_type first_child_type = e_rr_type::NUM_RR_TYPES;
+
+                        // Find the first CHANX/CHANY child to get the reference track
+                        for (const auto& child : opin_node.child_nodes()) {
+                            has_children = true;
+                            e_rr_type child_type = ntype(child.inode);
+                            if (child_type == e_rr_type::CHANX || child_type == e_rr_type::CHANY) {
+                                first_child_track = track(child.inode);
+                                first_child_type = child_type;
+                                break;
+                            }
+                        }
+
+                        // If we found an existing track, constrain to_node to use the same track
+                        if (has_children && first_child_track >= 0 && first_child_type == ntype(to_node)) {
+                            if (to_track != first_child_track) {
+                                VTR_LOGV_DEBUG(this->router_debug_,
+                                              "      Pruned expansion: OPIN %d already routes to track %d, "
+                                              "cannot use different track %d for fanout\n",
+                                              size_t(from_node), first_child_track, to_track);
+                                return; // Prune this edge - wrong track!
+                            } else {
+                                VTR_LOGV_DEBUG(this->router_debug_,
+                                              "      Allowing expansion: OPIN %d routing to same track %d "
+                                              "for multi-fanout\n",
+                                              size_t(from_node), first_child_track);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // === END MULTI-FANOUT SAME-TRACK CONSTRAINT ===
+
     // Check if the node exists in the route tree when RCV is enabled
     // Other pruning methods have been disabled when RCV is on, so this method is required to prevent "loops" from being created
     bool node_exists = false;

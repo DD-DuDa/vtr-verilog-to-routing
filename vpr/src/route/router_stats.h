@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unordered_map>
+#include <unordered_set>
 #include "netlist_fwd.h"
 #include "rr_graph_fwd.h"
 #include "rr_node_types.h"
@@ -11,11 +13,17 @@ struct ConnectionParameters {
     ConnectionParameters(ParentNetId net_id,
                          int target_pin_num,
                          bool router_opt_choke_points,
-                         const std::unordered_map<RRNodeId, int>& connection_choking_spots)
+                         const std::unordered_map<RRNodeId, int>& connection_choking_spots,
+                         const std::unordered_map<RRNodeId, std::unordered_set<int>>& blacklisted_tracks = {},
+                         const std::unordered_map<RRNodeId, std::unordered_set<int>>& existing_opin_tracks = {},
+                         bool allow_new_track_group = false)
         : net_id_(net_id)
         , target_pin_num_(target_pin_num)
         , router_opt_choke_points_(router_opt_choke_points)
-        , connection_choking_spots_(connection_choking_spots) {}
+        , connection_choking_spots_(connection_choking_spots)
+        , blacklisted_tracks_(blacklisted_tracks)
+        , existing_opin_tracks_(existing_opin_tracks)
+        , allow_new_track_group_(allow_new_track_group) {}
 
     // Net id of the connection
     ParentNetId net_id_;
@@ -28,6 +36,20 @@ struct ConnectionParameters {
     bool router_opt_choke_points_;
 
     const std::unordered_map<RRNodeId, int>& connection_choking_spots_;
+
+    // Map from OPIN RRNodeId to set of blacklisted track numbers
+    // Used for multi-fanout routing retry mechanism
+    const std::unordered_map<RRNodeId, std::unordered_set<int>>& blacklisted_tracks_;
+
+    // Map from OPIN RRNodeId to set of tracks already used by existing track groups
+    // When allow_new_track_group_ is true, new fanouts must NOT use these tracks
+    // This forces creation of a new branch on a different track
+    const std::unordered_map<RRNodeId, std::unordered_set<int>>& existing_opin_tracks_;
+
+    // When true, allow routing to use a different track from existing OPIN children
+    // This enables "track group relaxation" where a multicast net can split into
+    // multiple sub-broadcasts, each on a different track
+    bool allow_new_track_group_;
 };
 
 struct RouterStats {

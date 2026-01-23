@@ -7,6 +7,8 @@
 #include "route_net.h"
 #include "route_utils.h"
 #include "vtr_time.h"
+#include "vtr_log.h"
+#include <string>
 
 template<typename HeapType>
 inline RouteIterResults SerialNetlistRouter<HeapType>::route_netlist(int itry, float pres_fac, float worst_neg_slack) {
@@ -15,11 +17,32 @@ inline RouteIterResults SerialNetlistRouter<HeapType>::route_netlist(int itry, f
 
     vtr::Timer timer;
 
-    /* Sort so net with most sinks is routed first */
+    /* Sort so broadcast/multicast nets are routed first, then by sink count */
     auto sorted_nets = std::vector<ParentNetId>(_net_list.nets().begin(), _net_list.nets().end());
     std::stable_sort(sorted_nets.begin(), sorted_nets.end(), [&](ParentNetId id1, ParentNetId id2) -> bool {
+        // Check if nets are broadcast/multicast (contain "bcast" in name)
+        std::string name1 = _net_list.net_name(id1);
+        std::string name2 = _net_list.net_name(id2);
+        bool is_bcast1 = (name1.find("bcast") != std::string::npos);
+        bool is_bcast2 = (name2.find("bcast") != std::string::npos);
+
+        // Broadcast nets have highest priority
+        if (is_bcast1 && !is_bcast2) return true;
+        if (!is_bcast1 && is_bcast2) return false;
+
+        // Within same category, sort by sink count (most sinks first)
         return _net_list.net_sinks(id1).size() > _net_list.net_sinks(id2).size();
     });
+
+    // Log broadcast nets that will be routed first
+    VTR_LOG("Routing order: broadcast/multicast nets first\n");
+    for (size_t i = 0; i < sorted_nets.size() && i < 10; i++) {
+        std::string name = _net_list.net_name(sorted_nets[i]);
+        if (name.find("bcast") != std::string::npos) {
+            VTR_LOG("  [%zu] %s (broadcast, %zu sinks)\n", i, name.c_str(),
+                    _net_list.net_sinks(sorted_nets[i]).size());
+        }
+    }
 
     for (size_t inet = 0; inet < sorted_nets.size(); inet++) {
         ParentNetId net_id = sorted_nets[inet];
