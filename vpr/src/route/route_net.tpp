@@ -410,6 +410,18 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
     RRNodeId multicast_opin_node = RRNodeId::INVALID();
     size_t initial_tracks_count = 0;
 
+    // === TRACK GROUP RELAXATION STATE ===
+    // When single-track routing fails for all tracks, allow creating multiple track groups
+    // Each track group uses a different track from the OPIN
+    std::unordered_map<RRNodeId, std::unordered_set<int>> existing_opin_tracks;
+    bool allow_new_track_group = false;
+    bool track_group_relaxed = false;
+    unsigned relaxation_start_sink = 0;  // The sink index where relaxation was triggered
+    unsigned best_itarget_reached = 0;   // Highest itarget successfully routed across all retries
+    bool fallback_attempted = false;     // Prevent infinite fallback loops
+    unsigned track_groups_created = 0;   // Count of track groups created
+    const unsigned MAX_TRACK_GROUPS = 5; // Limit to prevent infinite loops
+
     if (is_multicast_net) {
         VTR_LOG("Detected multicast net '%s' with %u sinks\n", net_name.c_str(), num_sinks);
 
@@ -483,6 +495,23 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
 
         profiling::conn_start();
 
+        // === FALLBACK RELAXATION: Check if we've reached the pre-set split point ===
+        // In fallback mode, track_group_relaxed is true but allow_new_track_group is false
+        // When we reach relaxation_start_sink, enable the new track group
+        if (track_group_relaxed && !allow_new_track_group && itarget == relaxation_start_sink) {
+            VTR_LOG("  Reached pre-set split point at sink %u, enabling new track group\n", itarget);
+            allow_new_track_group = true;
+            track_groups_created++;  // Now creating group 2
+
+            // Record the tracks used so far (sinks 0 to itarget-1)
+            auto opin_tracks = extract_opin_tracks_from_route_tree(tree);
+            for (const auto& [opin_id, track_num] : opin_tracks) {
+                existing_opin_tracks[opin_id].insert(track_num);
+                VTR_LOG("  Track group 1: OPIN %zu uses track %d (sinks 0-%u)\n",
+                        size_t(opin_id), track_num, itarget - 1);
+            }
+        }
+
         // build a branch in the route tree to the target
         auto sink_flags = route_sink(router,
                                      net_list,
@@ -499,28 +528,42 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
                                      choking_spots,
                                      is_flat,
                                      net_bb,
-                                     blacklisted_tracks);
+                                     blacklisted_tracks,
+                                     existing_opin_tracks,
+                                     allow_new_track_group);
 
         flags.retry_with_full_bb |= sink_flags.retry_with_full_bb;
 
         if (!sink_flags.success) {
-            // Multi-fanout retry mechanism: if this isn't the first sink and we have track constraints,
-            // try ripping up and re-routing with the current track blacklisted
-            if (itarget > 0 && retry_attempt < MAX_TRACK_RETRY_ATTEMPTS) {
+            // Multi-fanout retry mechanism: try ripping up and re-routing with the current track blacklisted
+            // For multicast nets, this applies even when the first sink fails (itarget == 0)
+            bool can_retry = retry_attempt < MAX_TRACK_RETRY_ATTEMPTS;
+            bool should_retry = (itarget > 0) || (is_multicast_net && itarget == 0);
+
+            if (should_retry && can_retry) {
                 VTR_LOG("Routing failed for sink %d of net %d, attempting retry with track blacklisting\n",
                         target_pin, size_t(net_id));
 
                 // Extract which tracks were used by OPINs in the current (failed) routing
                 auto opin_tracks = extract_opin_tracks_from_route_tree(tree);
 
-                // Blacklist these tracks
+                // Blacklist these tracks (only blacklist tracks NOT in existing_opin_tracks when in relaxed mode)
                 for (const auto& [opin_id, track_num] : opin_tracks) {
+                    // In relaxed mode, don't blacklist tracks from the first group
+                    if (track_group_relaxed) {
+                        auto it = existing_opin_tracks.find(opin_id);
+                        if (it != existing_opin_tracks.end() && it->second.find(track_num) != it->second.end()) {
+                            // This is a track from group 1, don't blacklist it
+                            continue;
+                        }
+                    }
                     blacklisted_tracks[opin_id].insert(track_num);
                     VTR_LOG("  Blacklisting track %d for OPIN %d\n", track_num, size_t(opin_id));
                 }
 
                 // For multicast nets: check if we've exhausted initial tracks and need to unlock fallback
-                if (is_multicast_net && !fallback_unlocked && multicast_opin_node.is_valid()) {
+                // (Only applies before relaxation is triggered)
+                if (is_multicast_net && !track_group_relaxed && !fallback_unlocked && multicast_opin_node.is_valid()) {
                     auto it = blacklisted_tracks.find(multicast_opin_node);
                     if (it != blacklisted_tracks.end()) {
                         // Count how many of the initial tracks have been blacklisted
@@ -548,27 +591,179 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
                     }
                 }
 
-                // Rip up the net and retry from the beginning
                 retry_attempt++;
-                VTR_LOG("  Retry attempt %d/%d: ripping up net and re-routing with blacklisted tracks\n",
-                        retry_attempt, MAX_TRACK_RETRY_ATTEMPTS);
 
-                // Reset the routing for this net
-                setup_net(itry, net_id, net_list, connections_inf, router_opts, worst_negative_slack);
+                if (track_group_relaxed) {
+                    // In relaxed mode: DON'T rip up the tree, just retry current sink
+                    // The sinks in group 1 (0 to relaxation_start_sink-1) stay routed
 
-                // Reset high fanout lookup if needed
-                if (high_fanout) {
-                    spatial_route_tree_lookup = build_route_tree_spatial_lookup(net_list,
-                                                                                route_ctx.route_bb,
-                                                                                net_id,
-                                                                                tree.root());
+                    if (itarget == relaxation_start_sink) {
+                        // First sink of new group failed - retry with different new track
+                        VTR_LOG("  Retry attempt %d/%d (relaxed mode): retrying first sink of group 2 (sink %u) with blacklisted tracks\n",
+                                retry_attempt, MAX_TRACK_RETRY_ATTEMPTS, itarget);
+
+                        // Re-enable allow_new_track_group since we need to try another new track
+                        allow_new_track_group = true;
+
+                        // Retry just this sink
+                        itarget--;  // Will be incremented back to relaxation_start_sink
+                        continue;
+                    } else {
+                        // A sink AFTER the first sink of new group failed
+                        // This means the track established for the current group can't reach this sink
+                        // Create another track group for the remaining sinks (if under limit)
+                        if (track_groups_created >= MAX_TRACK_GROUPS) {
+                            VTR_LOG("  Sink %u failed, but max track groups (%u) reached, giving up\n",
+                                    itarget, MAX_TRACK_GROUPS);
+                            // Fall through to failure handling
+                        } else {
+                            VTR_LOG("  Sink %u failed within current track group (started at sink %u)\n",
+                                    itarget, relaxation_start_sink);
+                            VTR_LOG("  Creating new track group for remaining sinks\n");
+
+                            // Add the current group's track to existing_opin_tracks
+                            auto current_tracks = extract_opin_tracks_from_route_tree(tree);
+                            for (const auto& [opin_id, track_num] : current_tracks) {
+                                existing_opin_tracks[opin_id].insert(track_num);
+                            }
+
+                            // Clear blacklist and start fresh for the new group
+                            blacklisted_tracks.clear();
+
+                            // Update relaxation_start_sink to current sink
+                            relaxation_start_sink = itarget;
+
+                            // Re-enable allow_new_track_group for the new group
+                            allow_new_track_group = true;
+
+                            // Reset retry counter for the new group
+                            retry_attempt = 0;
+
+                            // Increment track group counter
+                            track_groups_created++;
+
+                            // Retry current sink
+                            itarget--;
+                            continue;
+                        }
+                    }
+                } else {
+                    // === CHECK IF WE SHOULD ENABLE TRACK GROUP RELAXATION ===
+                    // Before ripping up, check if we've nearly exhausted all track retries
+                    // and should switch to track group relaxation instead.
+                    // We trigger at MAX-2 because:
+                    //   - After rip-up, a different (earlier) sink may fail
+                    //   - If itarget becomes 0, relaxation can't trigger (no sinks to preserve)
+                    //   - Triggering 2 retries early gives buffer for the failing sink to change
+                    bool should_relax = is_multicast_net && retry_attempt >= MAX_TRACK_RETRY_ATTEMPTS - 2
+                                        && track_groups_created < MAX_TRACK_GROUPS;
+
+                    // Primary case: current failing sink is not sink 0, so we can preserve earlier sinks
+                    bool can_relax_current = should_relax && itarget > 0;
+
+                    // Fallback case: current sink is 0, but we know from previous attempts that
+                    // some sinks CAN be routed. Use best_itarget_reached as the split point.
+                    // This requires a fresh start with relaxation enabled from the beginning.
+                    // Only attempt fallback once to prevent infinite loops.
+                    bool can_relax_fallback = should_relax && itarget == 0 && best_itarget_reached > 0
+                                              && retry_attempt >= MAX_TRACK_RETRY_ATTEMPTS
+                                              && !fallback_attempted;
+
+                    if (can_relax_current) {
+                        VTR_LOG("\n=== TRACK GROUP RELAXATION for multicast net '%s' ===\n", net_name.c_str());
+                        VTR_LOG("After %d retries, enabling track group relaxation for sink %d (pin %d)\n",
+                                retry_attempt, itarget, target_pin);
+
+                        // Record which tracks are currently used by OPINs in the partially successful routing
+                        // These sinks (0 to itarget-1) are successfully routed; we want to keep them
+                        auto opin_tracks = extract_opin_tracks_from_route_tree(tree);
+                        for (const auto& [opin_id, track_num] : opin_tracks) {
+                            existing_opin_tracks[opin_id].insert(track_num);
+                            VTR_LOG("  Track group 1: OPIN %zu uses track %d (sinks 0-%u)\n",
+                                    size_t(opin_id), track_num, itarget - 1);
+                        }
+
+                        // Clear blacklist - we'll try all tracks again, but with relaxation enabled
+                        blacklisted_tracks.clear();
+
+                        // Enable track group relaxation mode
+                        // This tells the router to NOT use the existing tracks (forces new track)
+                        allow_new_track_group = true;
+                        track_group_relaxed = true;
+                        relaxation_start_sink = itarget;
+
+                        // Reset retry counter for the relaxed routing phase
+                        retry_attempt = 0;
+
+                        // Increment track group counter (initial relaxation creates group 2)
+                        track_groups_created = 2;  // Group 1 (existing) + Group 2 (new)
+
+                        // DON'T rip up the tree - keep sinks 0..itarget-1 routed on their track
+                        // Just retry routing this sink with relaxed constraint
+                        VTR_LOG("  Attempting to route sink %d and remaining sinks on a NEW track\n", itarget);
+                        itarget--;  // Will be incremented to retry current sink
+                        continue;
+                    } else if (can_relax_fallback) {
+                        // Fallback: sink 0 is failing, but we know from best_itarget_reached that
+                        // sinks 0 to best_itarget_reached-1 CAN be routed on some track.
+                        // Strategy: rip up, then route with preemptive split at best_itarget_reached
+                        VTR_LOG("\n=== TRACK GROUP RELAXATION (FALLBACK) for multicast net '%s' ===\n", net_name.c_str());
+                        VTR_LOG("Sink 0 failing after %d retries, but previously routed up to sink %u\n",
+                                retry_attempt, best_itarget_reached - 1);
+                        VTR_LOG("Will split at sink %u on next attempt\n", best_itarget_reached);
+
+                        // Mark fallback as attempted to prevent infinite loops
+                        fallback_attempted = true;
+
+                        // Clear blacklist for fresh start
+                        blacklisted_tracks.clear();
+
+                        // Enable relaxation mode, but DON'T set allow_new_track_group yet
+                        // It will be set when we reach the split point (best_itarget_reached)
+                        track_group_relaxed = true;
+                        relaxation_start_sink = best_itarget_reached;
+
+                        // Set track groups (will create group 2 when split point is reached)
+                        track_groups_created = 1;  // Group 1 exists, group 2 will be created at split
+
+                        // Reset retry counter
+                        retry_attempt = 0;
+
+                        // Rip up and restart - relaxation will kick in at the split point
+                        setup_net(itry, net_id, net_list, connections_inf, router_opts, worst_negative_slack);
+
+                        if (high_fanout) {
+                            spatial_route_tree_lookup = build_route_tree_spatial_lookup(net_list,
+                                                                                        route_ctx.route_bb,
+                                                                                        net_id,
+                                                                                        tree.root());
+                        }
+
+                        itarget = static_cast<unsigned>(-1);
+                        continue;
+                    }
+
+                    // Normal mode: rip up the net and retry from the beginning
+                    VTR_LOG("  Retry attempt %d/%d: ripping up net and re-routing with blacklisted tracks\n",
+                            retry_attempt, MAX_TRACK_RETRY_ATTEMPTS);
+
+                    // Reset the routing for this net
+                    setup_net(itry, net_id, net_list, connections_inf, router_opts, worst_negative_slack);
+
+                    // Reset high fanout lookup if needed
+                    if (high_fanout) {
+                        spatial_route_tree_lookup = build_route_tree_spatial_lookup(net_list,
+                                                                                    route_ctx.route_bb,
+                                                                                    net_id,
+                                                                                    tree.root());
+                    }
+
+                    // Restart routing from the first sink
+                    itarget = static_cast<unsigned>(-1); // Will be incremented to 0 in next iteration
+                    continue;
                 }
-
-                // Restart routing from the first sink
-                itarget = static_cast<unsigned>(-1); // Will be incremented to 0 in next iteration
-                continue;
             }
-            
+
             // If retry failed or wasn't applicable, give up
             flags.success = false;
             VTR_LOG("Routing failed for sink %d of net %d\n", target_pin, size_t(net_id));
@@ -579,8 +774,56 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
                                size_t(sink_rr),
                                pin_criticality[target_pin]);
 
+        // Track the highest itarget successfully routed (for relaxation decision)
+        if (!track_group_relaxed && itarget + 1 > best_itarget_reached) {
+            best_itarget_reached = itarget + 1;  // +1 because we've successfully routed up to and including itarget
+        }
+
+        // === TRACK GROUP RELAXATION: After first sink in new group routed ===
+        // After successfully routing the first sink in relaxed mode, turn off allow_new_track_group
+        // so subsequent sinks use the normal same-track constraint (within the new group)
+        if (allow_new_track_group && itarget == relaxation_start_sink) {
+            VTR_LOG("  Successfully routed first sink of track group 2 (sink %u)\n", itarget);
+
+            // Record the new track used by this sink
+            auto new_opin_tracks = extract_opin_tracks_from_route_tree(tree);
+            for (const auto& [opin_id, track_num] : new_opin_tracks) {
+                // Only record if this is a NEW track (not in existing_opin_tracks)
+                auto it = existing_opin_tracks.find(opin_id);
+                if (it == existing_opin_tracks.end() || it->second.find(track_num) == it->second.end()) {
+                    VTR_LOG("  Track group 2: OPIN %zu will use track %d\n", size_t(opin_id), track_num);
+                }
+            }
+
+            // Turn off relaxation mode - subsequent sinks should use same track as this one
+            allow_new_track_group = false;
+            VTR_LOG("  Disabled track group relaxation, remaining sinks will use same track\n");
+        }
+        // === END TRACK GROUP RELAXATION SUCCESS ===
+
         ++router_stats.connections_routed;
     } // finished all sinks
+
+    // === TRACK GROUP RELAXATION SUMMARY ===
+    if (track_group_relaxed && is_multicast_net) {
+        VTR_LOG("\n=== Track Group Relaxation Summary for '%s' ===\n", net_name.c_str());
+        auto final_tracks = extract_opin_tracks_from_route_tree(tree);
+
+        // Count unique tracks used
+        std::unordered_set<int> unique_tracks;
+        for (const auto& [opin_id, track_num] : final_tracks) {
+            unique_tracks.insert(track_num);
+        }
+
+        VTR_LOG("  Successfully routed %u sinks using %zu track group(s)\n",
+                num_sinks, existing_opin_tracks.empty() ? 1 : existing_opin_tracks.begin()->second.size() + 1);
+        VTR_LOG("  Tracks used: ");
+        for (int t : unique_tracks) {
+            VTR_LOG("%d ", t);
+        }
+        VTR_LOG("\n");
+    }
+    // === END TRACK GROUP RELAXATION SUMMARY ===
 
     ++router_stats.nets_routed;
     profiling::net_finish();
@@ -771,7 +1014,8 @@ inline NetResultFlags route_sink(ConnectionRouterType& router,
     bool net_is_clock = route_ctx.is_clock_net[net_id] != 0;
 
     bool router_opt_choke_points = ((int)choking_spots[target_pin].size() != 0) && router_opts.has_choke_point;
-    ConnectionParameters conn_params(net_id, target_pin, router_opt_choke_points, choking_spots[target_pin], blacklisted_tracks);
+    ConnectionParameters conn_params(net_id, target_pin, router_opt_choke_points, choking_spots[target_pin],
+                                     blacklisted_tracks, existing_opin_tracks, allow_new_track_group);
 
     //We normally route high fanout nets by only adding spatially close-by routing to the heap (reduces run-time).
     //However, if the current sink is 'critical' from a timing perspective, we put the entire route tree back onto
