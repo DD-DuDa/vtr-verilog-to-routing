@@ -31,4 +31,7 @@ class StaticMoveGenerator : public MoveGenerator {
                                float rlim,
                                const t_placer_opts& placer_opts,
                                const PlacerCriticalities* criticalities) override;
+
+    /// @brief Propagates the MacroLegalPositions pointer to all child move generators.
+    void set_macro_legal_positions(const class MacroLegalPositions* p) override;
 };

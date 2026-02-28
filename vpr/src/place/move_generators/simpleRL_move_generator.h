@@ -252,6 +252,13 @@ class SimpleRLMoveGenerator : public MoveGenerator {
 
     // Receives feedback about the outcome of the previously proposed move
     void process_outcome(double reward, e_reward_function reward_fun) override;
+
+    /// @brief Propagates the MacroLegalPositions pointer to all child move generators.
+    void set_macro_legal_positions(const class MacroLegalPositions* p) override {
+        for (auto& gen : all_moves) {
+            if (gen) gen->set_macro_legal_positions(p);
+        }
+    }
 };
 
 template<class T, class>

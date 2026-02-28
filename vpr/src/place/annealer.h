@@ -2,6 +2,7 @@
 
 #include "vpr_types.h"
 
+#include "macro_legal_positions.h"
 #include "move_generator.h" // movestats
 #include "net_cost_handler.h"
 #include "manual_move_generator.h"
@@ -308,6 +309,10 @@ class PlacementAnnealer {
 
     /// Keep record of moved blocks and affected pins in a swap
     t_pl_blocks_to_be_moved blocks_affected_;
+
+    /// Precomputed valid head positions for each macro; eliminates abort-heavy
+    /// random sampling when proposing macro moves.
+    MacroLegalPositions macro_legal_pos_;
 
   private:
     /**

@@ -147,6 +147,17 @@ class MoveGenerator {
     virtual void process_outcome(double /*reward*/, e_reward_function /*reward_fun*/) {}
 
     /**
+     * @brief Provides a pointer to the MacroLegalPositions data structure so that
+     * move generators can sample valid macro head positions directly, eliminating
+     * aborted moves due to illegal macro placements.
+     *
+     * The default implementation does nothing. Override in generators that use macros.
+     * Container generators (StaticMoveGenerator, SimpleRLMoveGenerator) should
+     * propagate the pointer to their child generators.
+     */
+    virtual void set_macro_legal_positions(const class MacroLegalPositions* /*p*/) {}
+
+    /**
      * @brief Calculates the agent's reward and the total process outcome
      *
      * @param move_outcome_stats Contains information about how much each cost term

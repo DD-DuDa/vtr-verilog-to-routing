@@ -285,6 +285,17 @@ PlacementAnnealer::PlacementAnnealer(const t_placer_opts& placer_opts,
     move_type_stats_.accepted_moves.resize({device_ctx.logical_block_types.size(), (int)e_move_type::NUMBER_OF_AUTO_MOVES}, 0);
     move_type_stats_.rejected_moves.resize({device_ctx.logical_block_types.size(), (int)e_move_type::NUMBER_OF_AUTO_MOVES}, 0);
 
+    // Initialize macro valid-head data structure before estimate_starting_temperature_()
+    // so that update() calls during temperature estimation work correctly.
+    {
+        const auto& grid = g_vpr_ctx.device().grid;
+        macro_legal_pos_.init(place_macros_,
+                              placer_state_.blk_loc_registry(),
+                              (int)grid.width(), (int)grid.height());
+    }
+    move_generator_1_->set_macro_legal_positions(&macro_legal_pos_);
+    move_generator_2_->set_macro_legal_positions(&macro_legal_pos_);
+
     // Update the starting temperature for placement annealing to a more appropriate value
     VTR_ASSERT_SAFE_MSG(auto_init_t_scale >= 0, "Initial temperature scale cannot be negative.");
     annealing_state_.t = estimate_starting_temperature_() * auto_init_t_scale;
@@ -560,6 +571,11 @@ e_move_result PlacementAnnealer::try_swap_(MoveGenerator& move_generator,
 
             // Update clb data structures since we kept the move.
             blk_loc_registry.commit_move_blocks(blocks_affected_);
+
+            // Update valid macro head positions based on what moved
+            if (macro_legal_pos_.has_macros()) {
+                macro_legal_pos_.update(blocks_affected_, place_macros_);
+            }
 
             if (noc_opts_.noc) {
                 noc_cost_handler_->commit_noc_costs();

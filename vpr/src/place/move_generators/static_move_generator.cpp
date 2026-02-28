@@ -1,6 +1,7 @@
 
 #include "static_move_generator.h"
 
+#include "macro_legal_positions.h"
 #include "median_move_generator.h"
 #include "place_macro.h"
 #include "weighted_median_move_generator.h"
@@ -31,6 +32,12 @@ StaticMoveGenerator::StaticMoveGenerator(PlacerState& placer_state,
     all_moves[e_move_type::FEASIBLE_REGION] = std::make_unique<FeasibleRegionMoveGenerator>(placer_state, place_macros_, net_cost_handler_, reward_function, rng);
 
     initialize_move_prob(move_probs);
+}
+
+void StaticMoveGenerator::set_macro_legal_positions(const MacroLegalPositions* p) {
+    for (auto& gen : all_moves) {
+        if (gen) gen->set_macro_legal_positions(p);
+    }
 }
 
 void StaticMoveGenerator::initialize_move_prob(const vtr::vector<e_move_type, float>& move_probs) {
