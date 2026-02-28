@@ -36,6 +36,9 @@
 #include "stats.h"
 
 #include <array>
+#include <fstream>
+#include <cstdlib>
+#include <unordered_map>
 
 static constexpr int MAX_FANOUT_CROSSING_COUNT = 50;
 
@@ -134,7 +137,44 @@ NetCostHandler::NetCostHandler(const t_placer_opts& placer_opts,
      * been recomputed. */
     bb_update_status_.resize(num_nets, NetUpdateState::NOT_UPDATED_YET);
 
+    // Initialize per-net weights to 1.0 (no bias); load overrides from file if set
+    net_weight_.resize(num_nets, 1.0f);
+    const char* weights_file = std::getenv("VPR_NET_WEIGHTS_FILE");
+    if (weights_file) {
+        load_net_weights_(weights_file);
+    }
+
     alloc_and_load_chan_w_factors_for_place_cost_();
+}
+
+void NetCostHandler::load_net_weights_(const char* path) {
+    const auto& cluster_ctx = g_vpr_ctx.clustering();
+
+    // Build name → ClusterNetId reverse map
+    std::unordered_map<std::string, ClusterNetId> name_to_id;
+    for (ClusterNetId net_id : cluster_ctx.clb_nlist.nets()) {
+        name_to_id[cluster_ctx.clb_nlist.net_name(net_id)] = net_id;
+    }
+
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        VTR_LOG_WARN("VPR_NET_WEIGHTS_FILE '%s' could not be opened; net weights ignored\n", path);
+        return;
+    }
+
+    std::string net_name;
+    float weight;
+    int count = 0;
+    while (f >> net_name >> weight) {
+        auto it = name_to_id.find(net_name);
+        if (it != name_to_id.end()) {
+            net_weight_[it->second] = weight;
+            ++count;
+        } else {
+            VTR_LOG_WARN("Net '%s' in VPR_NET_WEIGHTS_FILE not found in netlist; skipping\n", net_name.c_str());
+        }
+    }
+    VTR_LOG("Loaded %d inter-op net weights from '%s'\n", count, path);
 }
 
 void NetCostHandler::alloc_and_load_chan_w_factors_for_place_cost_() {
@@ -257,7 +297,7 @@ std::pair<double, double> NetCostHandler::comp_cube_bb_cost_(e_cost_methods meth
                 get_non_updatable_cube_bb_(net_id, /*use_ts=*/false);
             }
 
-            net_cost_[net_id] = get_net_cube_bb_cost_(net_id, /*use_ts=*/false);
+            net_cost_[net_id] = get_net_cube_bb_cost_(net_id, /*use_ts=*/false) * net_weight_[net_id];
             cost += net_cost_[net_id];
             if (method == e_cost_methods::CHECK) {
                 expected_wirelength += get_net_wirelength_estimate_(net_id);
@@ -287,7 +327,7 @@ std::pair<double, double> NetCostHandler::comp_per_layer_bb_cost_(e_cost_methods
                 get_non_updatable_per_layer_bb_(net_id, /*use_ts=*/false);
             }
 
-            net_cost_[net_id] = get_net_per_layer_bb_cost_(net_id, /*use_ts=*/false);
+            net_cost_[net_id] = get_net_per_layer_bb_cost_(net_id, /*use_ts=*/false) * net_weight_[net_id];
             cost += net_cost_[net_id];
             if (method == e_cost_methods::CHECK) {
                 expected_wirelength += get_net_wirelength_from_layer_bb_(net_id);
@@ -1498,7 +1538,7 @@ void NetCostHandler::set_bb_delta_cost_(double& bb_delta_c) {
     for (const ClusterNetId ts_net : ts_nets_to_update_) {
         ClusterNetId net_id = ts_net;
 
-        proposed_net_cost_[net_id] = get_net_bb_cost_functor_(net_id);
+        proposed_net_cost_[net_id] = get_net_bb_cost_functor_(net_id) * net_weight_[net_id];
 
         bb_delta_c += proposed_net_cost_[net_id] - net_cost_[net_id];
     }

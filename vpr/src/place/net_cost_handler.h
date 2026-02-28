@@ -11,6 +11,7 @@
 #include "vtr_prefix_sum.h"
 
 #include <functional>
+#include <unordered_map>
 
 class PlacerState;
 class PlacerCriticalities;
@@ -231,6 +232,18 @@ class NetCostHandler {
     vtr::vector<ClusterNetId, double> net_cost_;
     vtr::vector<ClusterNetId, double> proposed_net_cost_;
     vtr::vector<ClusterNetId, NetUpdateState> bb_update_status_;
+
+    /**
+     * @brief Per-net placement weights loaded from VPR_NET_WEIGHTS_FILE.
+     * Defaults to 1.0 for all nets. Weighted nets incur higher cost when
+     * far from their neighbors, biasing SA to keep them close.
+     */
+    vtr::vector<ClusterNetId, float> net_weight_;
+
+    /**
+     * @brief Load per-net weights from a text file (one "net_name weight" per line).
+     */
+    void load_net_weights_(const char* path);
 
     /**
      * @brief Matrices below are used to precompute the inverse of the average

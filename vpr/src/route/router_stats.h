@@ -16,14 +16,16 @@ struct ConnectionParameters {
                          const std::unordered_map<RRNodeId, int>& connection_choking_spots,
                          const std::unordered_map<RRNodeId, std::unordered_set<int>>& blacklisted_tracks = {},
                          const std::unordered_map<RRNodeId, std::unordered_set<int>>& existing_opin_tracks = {},
-                         bool allow_new_track_group = false)
+                         bool allow_new_track_group = false,
+                         int heuristic_forced_track = -1)
         : net_id_(net_id)
         , target_pin_num_(target_pin_num)
         , router_opt_choke_points_(router_opt_choke_points)
         , connection_choking_spots_(connection_choking_spots)
         , blacklisted_tracks_(blacklisted_tracks)
         , existing_opin_tracks_(existing_opin_tracks)
-        , allow_new_track_group_(allow_new_track_group) {}
+        , allow_new_track_group_(allow_new_track_group)
+        , heuristic_forced_track_(heuristic_forced_track) {}
 
     // Net id of the connection
     ParentNetId net_id_;
@@ -50,6 +52,11 @@ struct ConnectionParameters {
     // This enables "track group relaxation" where a multicast net can split into
     // multiple sub-broadcasts, each on a different track
     bool allow_new_track_group_;
+
+    // Heuristic routing: when >= 0, force the OPIN's first fanout to use this
+    // specific track. Subsequent fanouts are locked in by the same-track constraint.
+    // Set to route_chan_width - 1 for broadcast nets when VPR_HEURISTIC_ROUTING=1.
+    int heuristic_forced_track_;
 };
 
 struct RouterStats {

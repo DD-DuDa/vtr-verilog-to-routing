@@ -6,6 +6,7 @@
 
 #include <tuple>
 #include <functional>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -182,6 +183,90 @@ inline std::unordered_map<RRNodeId, int> extract_opin_tracks_from_route_tree(con
     return opin_tracks;
 }
 
+inline bool is_heuristic_bcast_net_name(const std::string& net_name) {
+    static const bool k_heuristic_routing = []() {
+        const char* v = std::getenv("VPR_HEURISTIC_ROUTING");
+        return v != nullptr && std::atoi(v) > 0;
+    }();
+    if (!k_heuristic_routing) return false;
+
+    // nullptr  → env var not set → backward-compat: all "bcast" nets use W-1
+    // ""       → env var set to empty → explicit empty list: no heuristic bcast nets
+    // "a,b,c"  → explicit allow-list: only those nets use W-1
+    static const char* k_raw = std::getenv("VPR_HEURISTIC_BCAST_NETS");
+
+    static const std::unordered_set<std::string> k_heuristic_nets = []() {
+        std::unordered_set<std::string> out;
+        if (k_raw == nullptr || k_raw[0] == '\0') return out;
+        std::stringstream ss(k_raw);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            if (!tok.empty()) out.insert(tok);
+        }
+        return out;
+    }();
+
+    // If env var was set (even to empty string), honour the explicit list.
+    // If env var was never set (nullptr), fall back to "all bcast nets" behaviour.
+    if (k_raw != nullptr) {
+        return k_heuristic_nets.find(net_name) != k_heuristic_nets.end();
+    }
+    return net_name.find("bcast") != std::string::npos;
+}
+
+/**
+ * Return true when net_name is in the heuristic reduce allowlist, and set
+ * forced_track_offset to 2 (W-2) or 3 (W-3) depending on which list it
+ * belongs to.
+ *
+ * Controlled by:
+ *   VPR_HEURISTIC_ROUTING=1               (master switch, same as broadcast)
+ *   VPR_HEURISTIC_REDUCE_NETS_W2=...     comma-separated list → track W-2
+ *   VPR_HEURISTIC_REDUCE_NETS_W3=...     comma-separated list → track W-3
+ */
+inline bool is_heuristic_reduce_net_name(const std::string& net_name,
+                                          int& forced_track_offset) {
+    static const bool k_heuristic_routing = []() {
+        const char* v = std::getenv("VPR_HEURISTIC_ROUTING");
+        return v != nullptr && std::atoi(v) > 0;
+    }();
+    if (!k_heuristic_routing) return false;
+
+    static const std::unordered_set<std::string> k_reduce_w2_nets = []() {
+        std::unordered_set<std::string> out;
+        const char* raw = std::getenv("VPR_HEURISTIC_REDUCE_NETS_W2");
+        if (raw == nullptr) return out;
+        std::stringstream ss(raw);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            if (!tok.empty()) out.insert(tok);
+        }
+        return out;
+    }();
+
+    static const std::unordered_set<std::string> k_reduce_w3_nets = []() {
+        std::unordered_set<std::string> out;
+        const char* raw = std::getenv("VPR_HEURISTIC_REDUCE_NETS_W3");
+        if (raw == nullptr) return out;
+        std::stringstream ss(raw);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            if (!tok.empty()) out.insert(tok);
+        }
+        return out;
+    }();
+
+    if (k_reduce_w2_nets.count(net_name)) {
+        forced_track_offset = 2;
+        return true;
+    }
+    if (k_reduce_w3_nets.count(net_name)) {
+        forced_track_offset = 3;
+        return true;
+    }
+    return false;
+}
+
 /** Attempt to route a single net.
  *
  * @param router The ConnectionRouterType instance
@@ -298,26 +383,35 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
     // Check if this is a multicast/broadcast net
     std::string net_name = net_list.net_name(net_id);
     bool is_multicast_net = (net_name.find("bcast") != std::string::npos) && (num_sinks > 1);
+    bool is_heuristic_bcast = is_multicast_net && is_heuristic_bcast_net_name(net_name);
 
-    if (is_multicast_net) {
-        // For multicast nets: sort sinks by Y-coordinate DESCENDING (higher Y first)
-        // This ensures we route to sinks closer to the source first, then expand outward
-        // This avoids "backtracking" issues with direction-constrained routing
+    if (is_heuristic_bcast) {
+        // Under heuristic routing: sort by Manhattan distance from source, nearest first.
+        RRNodeId source_rr = route_ctx.net_rr_terminals[net_id][0];
+        int src_x = rr_graph.node_xlow(source_rr);
+        int src_y = rr_graph.node_ylow(source_rr);
+
         std::stable_sort(begin(remaining_targets), end(remaining_targets), [&](int a, int b) {
             RRNodeId sink_a = route_ctx.net_rr_terminals[net_id][a];
             RRNodeId sink_b = route_ctx.net_rr_terminals[net_id][b];
-            int y_a = rr_graph.node_ylow(sink_a);
-            int y_b = rr_graph.node_ylow(sink_b);
-            // Higher Y first (descending order)
-            return y_a > y_b;
+
+            int ax = rr_graph.node_xlow(sink_a);
+            int ay = rr_graph.node_ylow(sink_a);
+            int bx = rr_graph.node_xlow(sink_b);
+            int by = rr_graph.node_ylow(sink_b);
+
+            int dist_a = std::abs(ax - src_x) + std::abs(ay - src_y);
+            int dist_b = std::abs(bx - src_x) + std::abs(by - src_y);
+            if (dist_a != dist_b) return dist_a < dist_b;
+
+            // Deterministic tie-breakers.
+            if (ay != by) return ay < by;
+            return ax < bx;
         });
-        VTR_LOG("Multicast net '%s': sorted sinks by Y-coordinate (high to low)\n", net_name.c_str());
-        for (int pin : remaining_targets) {
-            RRNodeId sink = route_ctx.net_rr_terminals[net_id][pin];
-            VTR_LOG("  Sink pin %d at Y=%d\n", pin, rr_graph.node_ylow(sink));
-        }
+        VTR_LOG("Multicast net '%s': sorted sinks by Manhattan distance from source (%d,%d), nearest first\n",
+                net_name.c_str(), src_x, src_y);
     } else {
-        // For regular nets: sort by criticality (original behavior)
+        // Original VPR behavior: sort by criticality.
         std::stable_sort(begin(remaining_targets), end(remaining_targets), [&](int a, int b) {
             return pin_criticality[a] > pin_criticality[b];
         });
@@ -420,9 +514,9 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
     unsigned best_itarget_reached = 0;   // Highest itarget successfully routed across all retries
     bool fallback_attempted = false;     // Prevent infinite fallback loops
     unsigned track_groups_created = 0;   // Count of track groups created
-    const unsigned MAX_TRACK_GROUPS = 5; // Limit to prevent infinite loops
+    const unsigned MAX_TRACK_GROUPS = 5; // Limit to match CSL template's 3 color slots (_0, _1, _2)
 
-    if (is_multicast_net) {
+    if (is_multicast_net && !is_heuristic_bcast) {
         VTR_LOG("Detected multicast net '%s' with %u sinks\n", net_name.c_str(), num_sinks);
 
         // Collect all sink RR nodes
@@ -538,7 +632,7 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
             // Multi-fanout retry mechanism: try ripping up and re-routing with the current track blacklisted
             // For multicast nets, this applies even when the first sink fails (itarget == 0)
             bool can_retry = retry_attempt < MAX_TRACK_RETRY_ATTEMPTS;
-            bool should_retry = (itarget > 0) || (is_multicast_net && itarget == 0);
+            bool should_retry = ((itarget > 0) || (is_multicast_net && itarget == 0)) && !is_heuristic_bcast;
 
             if (should_retry && can_retry) {
                 VTR_LOG("Routing failed for sink %d of net %d, attempting retry with track blacklisting\n",
@@ -655,7 +749,8 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
                     //   - After rip-up, a different (earlier) sink may fail
                     //   - If itarget becomes 0, relaxation can't trigger (no sinks to preserve)
                     //   - Triggering 2 retries early gives buffer for the failing sink to change
-                    bool should_relax = is_multicast_net && retry_attempt >= MAX_TRACK_RETRY_ATTEMPTS - 2
+                    bool should_relax = is_multicast_net && !is_heuristic_bcast
+                                        && retry_attempt >= MAX_TRACK_RETRY_ATTEMPTS - 2
                                         && track_groups_created < MAX_TRACK_GROUPS;
 
                     // Primary case: current failing sink is not sink 0, so we can preserve earlier sinks
@@ -1014,8 +1109,41 @@ inline NetResultFlags route_sink(ConnectionRouterType& router,
     bool net_is_clock = route_ctx.is_clock_net[net_id] != 0;
 
     bool router_opt_choke_points = ((int)choking_spots[target_pin].size() != 0) && router_opts.has_choke_point;
+
+    // === HEURISTIC FORCED TRACK ===
+    // When VPR_HEURISTIC_ROUTING=1:
+    //   broadcast nets  → forced to track W-1   (one dedicated column track)
+    //   reduce nets W-2 → forced to track W-2   (even hops in the reduce chain)
+    //   reduce nets W-3 → forced to track W-3   (odd  hops in the reduce chain)
+    int heuristic_forced_track = -1;
+    {
+        std::string route_net_name = net_list.net_name(net_id);
+        int effective_chan_width = router_opts.fixed_channel_width;
+        if (effective_chan_width <= 0) {
+            effective_chan_width = device_ctx.chan_width.max;
+        }
+        if (is_heuristic_bcast_net_name(route_net_name)) {
+            if (route_net_name.find("bcast") != std::string::npos) {
+                // Prefer the explicit fixed channel width from router opts; if unavailable,
+                // fall back to the device channel width so heuristic routing remains active.
+                if (effective_chan_width > 0) {
+                    heuristic_forced_track = effective_chan_width - 1;
+                }
+            }
+        } else {
+            int reduce_track_offset = -1;
+            if (is_heuristic_reduce_net_name(route_net_name, reduce_track_offset)) {
+                if (effective_chan_width > 0 && reduce_track_offset > 0) {
+                    heuristic_forced_track = effective_chan_width - reduce_track_offset;
+                }
+            }
+        }
+    }
+    // === END HEURISTIC FORCED TRACK ===
+
     ConnectionParameters conn_params(net_id, target_pin, router_opt_choke_points, choking_spots[target_pin],
-                                     blacklisted_tracks, existing_opin_tracks, allow_new_track_group);
+                                     blacklisted_tracks, existing_opin_tracks, allow_new_track_group,
+                                     heuristic_forced_track);
 
     //We normally route high fanout nets by only adding spatially close-by routing to the heap (reduces run-time).
     //However, if the current sink is 'critical' from a timing perspective, we put the entire route tree back onto

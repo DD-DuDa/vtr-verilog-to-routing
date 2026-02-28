@@ -299,11 +299,64 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
     VTR_LOGV_DEBUG(this->router_debug_, "      Expanding node %d edge %zu -> %d\n",
                    from_node, size_t(from_edge), size_t(to_node));
 
+    // === HEURISTIC BROADCAST GEOMETRIC CONSTRAINT ===
+    // For heuristic broadcast nets, heavily constrain expansion so routing is
+    // deterministic-like: fixed track (enforced elsewhere), source-column corridor,
+    // and monotonic Y movement from source toward sink.
+    if (this->conn_params_ && this->conn_params_->heuristic_forced_track_ >= 0
+        && this->conn_params_->net_id_ != ParentNetId::INVALID()
+        && this->conn_params_->target_pin_num_ >= 0) {
+        auto& route_ctx_h = g_vpr_ctx.routing();
+        ParentNetId hnet_id = this->conn_params_->net_id_;
+        int htarget_pin = this->conn_params_->target_pin_num_;
+
+        if (size_t(hnet_id) < route_ctx_h.net_rr_terminals.size()
+            && !route_ctx_h.net_rr_terminals[hnet_id].empty()
+            && htarget_pin < (int)route_ctx_h.net_rr_terminals[hnet_id].size()) {
+            RRNodeId src_rr = route_ctx_h.net_rr_terminals[hnet_id][0];
+            RRNodeId sink_rr = route_ctx_h.net_rr_terminals[hnet_id][htarget_pin];
+
+            int src_x = this->rr_graph_->node_xlow(src_rr);
+            int src_y = this->rr_graph_->node_ylow(src_rr);
+            int sink_x = this->rr_graph_->node_xlow(sink_rr);
+            int sink_y = this->rr_graph_->node_ylow(sink_rr);
+
+            e_rr_type to_type = this->rr_graph_->node_type(to_node);
+            int to_x = this->rr_graph_->node_xlow(to_node);
+            int to_y = this->rr_graph_->node_ylow(to_node);
+
+            // Allow only a tight column corridor around source/destination columns.
+            int col_lo = std::min(src_x, sink_x) - 1; // include CHANY x-offset convention
+            int col_hi = std::max(src_x, sink_x);
+            if ((to_type == e_rr_type::CHANX || to_type == e_rr_type::CHANY || to_type == e_rr_type::IPIN)
+                && (to_x < col_lo || to_x > col_hi)) {
+                return;
+            }
+
+            // Enforce monotonic Y progression from source toward sink for CHAN nodes.
+            if (to_type == e_rr_type::CHANX || to_type == e_rr_type::CHANY) {
+                if (sink_y >= src_y) {
+                    if (to_y < src_y || to_y > sink_y) return;
+                    if (to_y < this->rr_graph_->node_ylow(from_node)) return;
+                } else {
+                    if (to_y > src_y || to_y < sink_y) return;
+                    if (to_y > this->rr_graph_->node_ylow(from_node)) return;
+                }
+            }
+        }
+    }
+    // === END HEURISTIC BROADCAST GEOMETRIC CONSTRAINT ===
+
     // === CUSTOM ILLEGAL-PATTERN PRUNING (enable when needed) ===
     // Set this to true to activate the constraints
     // printf("Using serial_connection_router.cpp\n"); // we use this for routing
     static constexpr bool k_enable_track_constraints = true;
-    if (k_enable_track_constraints) {
+    // Heuristic broadcast routing already pins OPIN fanout to a fixed track.
+    // Skip the custom illegal-pattern pruning for these nets so VPR can take
+    // the most direct legal path on the forced track.
+    bool is_heuristic_bcast = (this->conn_params_ != nullptr
+                               && this->conn_params_->heuristic_forced_track_ >= 0);
+    if (k_enable_track_constraints && !is_heuristic_bcast) {
         auto ntype = [&](RRNodeId n) { return this->rr_graph_->node_type(n); };
         auto track = [&](RRNodeId n) { return this->rr_graph_->node_track_num(n); };
         auto y_of  = [&](RRNodeId n) { return this->rr_graph_->node_ylow(n); };
@@ -614,6 +667,59 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
 
         }
 
+        /* Prune CHAN→IPIN when a DIFFERENT net already uses the same track
+         * at the PE's switch block (located at the IPIN's coordinates).
+         * The same net's own branches at this SB are allowed (broadcast fanout). */
+        if (!forbid && (ntype(to_node) == e_rr_type::IPIN) &&
+            (ntype(from_node) == e_rr_type::CHANX || ntype(from_node) == e_rr_type::CHANY)) {
+            int layer = this->rr_graph_->node_layer(from_node);
+            int track_num = track(from_node);
+            // PE's SB is at the IPIN's grid position (top-right corner of PE)
+            int sx = x_of(to_node);
+            int sy = y_of(to_node);
+
+            // Get the current net's route tree to exclude its own nodes
+            const RouteTree* current_tree = nullptr;
+            auto& route_ctx = g_vpr_ctx.routing();
+            if (this->conn_params_ && this->conn_params_->net_id_ != ParentNetId::INVALID()) {
+                ParentNetId net_id = this->conn_params_->net_id_;
+                if (route_ctx.route_trees[net_id]) {
+                    current_tree = &route_ctx.route_trees[net_id].value();
+                }
+            }
+
+            const auto& lookup = this->rr_graph_->node_lookup();
+            bool other_net_at_sb = false;
+
+            // Check CHANX at (sx, sy) and (sx+1, sy)
+            for (int cx = sx; cx <= sx + 1 && !other_net_at_sb; ++cx) {
+                for (RRNodeId n : lookup.find_channel_nodes(layer, cx, sy, e_rr_type::CHANX)) {
+                    if (n == from_node) continue;
+                    if (this->rr_graph_->node_track_num(n) != track_num) continue;
+                    if (this->rr_node_route_inf_[n].occ() <= 0) continue;
+                    // Skip nodes belonging to the current net's route tree
+                    if (current_tree && current_tree->find_by_rr_id(n).has_value()) continue;
+                    other_net_at_sb = true;
+                    break;
+                }
+            }
+            // Check CHANY at (sx, sy) and (sx, sy+1)
+            for (int cy = sy; cy <= sy + 1 && !other_net_at_sb; ++cy) {
+                for (RRNodeId n : lookup.find_channel_nodes(layer, sx, cy, e_rr_type::CHANY)) {
+                    if (n == from_node) continue;
+                    if (this->rr_graph_->node_track_num(n) != track_num) continue;
+                    if (this->rr_node_route_inf_[n].occ() <= 0) continue;
+                    if (current_tree && current_tree->find_by_rr_id(n).has_value()) continue;
+                    other_net_at_sb = true;
+                    break;
+                }
+            }
+
+            if (other_net_at_sb) {
+                forbid = true;
+            }
+        }
+
         if (forbid) {
             VTR_LOGV_DEBUG(this->router_debug_,
                             "      Pruned by custom track constraints: %d -> %d -> %d\n",
@@ -650,6 +756,20 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
                         return; // Prune this edge - blacklisted track!
                     }
                 }
+
+                // === HEURISTIC FORCED TRACK ===
+                // When heuristic_forced_track_ >= 0, force *all* OPIN fanouts of this
+                // connection to the same track. This prevents relaxed multicast retries
+                // from splitting a broadcast net across multiple tracks.
+                if (this->conn_params_->heuristic_forced_track_ >= 0
+                        && to_track != this->conn_params_->heuristic_forced_track_) {
+                    VTR_LOGV_DEBUG(this->router_debug_,
+                                  "      Pruned expansion: heuristic forces OPIN %d to track %d, "
+                                  "rejecting track %d\n",
+                                  size_t(from_node), this->conn_params_->heuristic_forced_track_, to_track);
+                    return; // Prune - heuristic routing forces a specific track
+                }
+                // === END HEURISTIC FORCED TRACK ===
 
                 // === TRACK GROUP RELAXATION ===
                 // When allow_new_track_group_ is true, we're creating a new track group
