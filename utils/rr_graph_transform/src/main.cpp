@@ -1,192 +1,693 @@
 /**
  * @file main.cpp
- * @brief Fast RR Graph transformation tool
- * 
- * This tool transforms RR graph XML files by removing edges connected to specific nodes.
- * 
- * Removes edges where sink_node or src_node equals the ID of:
- * - CHANY nodes when xhigh="0" and xlow="0"
- * - CHANX nodes when yhigh="0" and ylow="0"
- * 
- * The nodes themselves are kept in the graph.
- * 
- * Usage: rr_graph_transform input.xml output.xml
+ * @brief RR graph transformation utility.
+ *
+ * Modes:
+ * - boundary (default): legacy boundary-edge pruning.
+ * - cerebras: gate-mediated rewiring + global bypass cleanup.
+ *
+ * Usage:
+ *   rr_graph_transform <input.xml> <output.xml>
+ *   rr_graph_transform --mode boundary <input.xml> <output.xml>
+ *   rr_graph_transform --mode cerebras <input.xml> <output.xml>
  */
 
-#include <iostream>
-#include <fstream>
-#include <unordered_set>
-#include <vector>
-#include <string>
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "pugixml.hpp"
 
-/**
- * @brief Transform RR graph by removing edges connected to boundary nodes
- * 
- * @param input_file Path to input XML file
- * @param output_file Path to output XML file
- * @return true if transformation succeeded
- */
-bool transform_rr_graph(const char* input_file, const char* output_file) {
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
-    // Parse the XML file
+namespace {
+
+enum class TransformMode {
+    kBoundary,
+    kCerebras,
+};
+
+struct NodeInfo {
+    int id = -1;
+    std::string type;
+    int layer = 0;
+    int xlow = 0;
+    int xhigh = 0;
+    int ylow = 0;
+    int yhigh = 0;
+    int ptc = -1;
+    int capacity = 1;
+    pugi::xml_node xml_node;
+};
+
+struct EdgeInfo {
+    int src = -1;
+    int sink = -1;
+    int switch_id = -1;
+};
+
+struct RemovedEdgeInfo {
+    int base_src = -1;
+    int dst = -1;
+    int switch_id = -1;
+};
+
+struct ParsedGraph {
     pugi::xml_document doc;
-    pugi::xml_parse_result result = doc.load_file(input_file);
-    
+    pugi::xml_node rr_graph;
+    pugi::xml_node rr_nodes;
+    pugi::xml_node rr_edges;
+    pugi::xml_node grid;
+    pugi::xml_node block_types;
+
+    std::unordered_map<int, NodeInfo> nodes_by_id;
+    std::unordered_map<std::string, int> node_key_to_id;
+    std::unordered_set<long long> pe_tiles_xy;
+
+    std::vector<EdgeInfo> edges;
+
+    pugi::xml_node chany_template;
+    int max_node_id = -1;
+    int max_grid_layer = 0;
+    int max_node_layer = 0;
+};
+
+long long xy_key(int x, int y) {
+    return (static_cast<long long>(x) << 32) ^ static_cast<unsigned int>(y);
+}
+
+int to_int(const pugi::xml_attribute& attr, int default_val = 0) {
+    if (!attr) return default_val;
+    return attr.as_int(default_val);
+}
+
+void set_int_attr(pugi::xml_node node, const char* name, int value) {
+    pugi::xml_attribute attr = node.attribute(name);
+    if (!attr) {
+        attr = node.append_attribute(name);
+    }
+    attr.set_value(value);
+}
+
+std::string node_key(const std::string& type, int layer, int x, int y, int ptc) {
+    std::ostringstream oss;
+    oss << type << "|" << layer << "|" << x << "|" << y << "|" << ptc;
+    return oss.str();
+}
+
+int find_node_id(const ParsedGraph& g, const std::string& type, int layer, int x, int y, int ptc) {
+    const auto it = g.node_key_to_id.find(node_key(type, layer, x, y, ptc));
+    if (it == g.node_key_to_id.end()) return -1;
+    return it->second;
+}
+
+bool is_channel_type(const std::string& type) {
+    return type == "CHANX" || type == "CHANY";
+}
+
+bool is_unit_node(const NodeInfo& n) {
+    return (n.xlow == n.xhigh) && (n.ylow == n.yhigh);
+}
+
+bool parse_graph(const char* input_file, ParsedGraph& g) {
+    pugi::xml_parse_result result = g.doc.load_file(input_file);
     if (!result) {
-        std::cerr << "Error: Failed to parse " << input_file << ": " << result.description() << std::endl;
+        std::cerr << "Error: Failed to parse " << input_file << ": " << result.description() << "\n";
         return false;
     }
-    
-    auto parse_time = std::chrono::high_resolution_clock::now();
-    std::cout << "XML parsing completed in " 
-              << std::chrono::duration<double>(parse_time - start_time).count() 
-              << " seconds" << std::endl;
-    
-    // Get the rr_graph root
-    pugi::xml_node rr_graph = doc.child("rr_graph");
-    if (!rr_graph) {
-        std::cerr << "Error: No rr_graph root element found" << std::endl;
+
+    g.rr_graph = g.doc.child("rr_graph");
+    if (!g.rr_graph) {
+        std::cerr << "Error: No rr_graph root element found\n";
         return false;
     }
-    
-    // Set to store IDs of nodes whose edges should be removed
-    std::unordered_set<std::string> target_node_ids;
-    
-    // Find rr_nodes section
-    pugi::xml_node rr_nodes = rr_graph.child("rr_nodes");
-    if (!rr_nodes) {
-        std::cerr << "Error: No rr_nodes section found" << std::endl;
+
+    g.rr_nodes = g.rr_graph.child("rr_nodes");
+    g.rr_edges = g.rr_graph.child("rr_edges");
+    g.grid = g.rr_graph.child("grid");
+    g.block_types = g.rr_graph.child("block_types");
+
+    if (!g.rr_nodes) {
+        std::cerr << "Error: No rr_nodes section found\n";
         return false;
     }
-    
-    // First pass: identify target nodes and collect their IDs
-    for (pugi::xml_node node = rr_nodes.child("node"); node; node = node.next_sibling("node")) {
-        const char* node_type = node.attribute("type").value();
-        const char* node_id = node.attribute("id").value();
-        
-        if (!node_type || !node_id || node_type[0] == '\0' || node_id[0] == '\0') {
-            continue;
+    if (!g.rr_edges) {
+        std::cerr << "Error: No rr_edges section found\n";
+        return false;
+    }
+
+    // Find pe_tile block type id.
+    int pe_block_type_id = -1;
+    if (g.block_types) {
+        for (pugi::xml_node bt = g.block_types.child("block_type"); bt; bt = bt.next_sibling("block_type")) {
+            const char* name = bt.attribute("name").value();
+            if (name && std::strcmp(name, "pe_tile") == 0) {
+                pe_block_type_id = bt.attribute("id").as_int(-1);
+                break;
+            }
         }
-        
+    }
+
+    // Parse grid and track max grid layer.
+    if (g.grid) {
+        for (pugi::xml_node gl = g.grid.child("grid_loc"); gl; gl = gl.next_sibling("grid_loc")) {
+            int layer = to_int(gl.attribute("layer"), 0);
+            g.max_grid_layer = std::max(g.max_grid_layer, layer);
+
+            if (pe_block_type_id >= 0 && to_int(gl.attribute("block_type_id"), -1) == pe_block_type_id) {
+                int x = to_int(gl.attribute("x"), 0);
+                int y = to_int(gl.attribute("y"), 0);
+                g.pe_tiles_xy.insert(xy_key(x, y));
+            }
+        }
+    }
+
+    // Parse nodes.
+    for (pugi::xml_node node = g.rr_nodes.child("node"); node; node = node.next_sibling("node")) {
+        NodeInfo n;
+        n.id = to_int(node.attribute("id"), -1);
+        if (n.id < 0) continue;
+
+        n.type = node.attribute("type").value();
+        n.capacity = to_int(node.attribute("capacity"), 1);
+        n.xml_node = node;
+
         pugi::xml_node loc = node.child("loc");
-        if (!loc) {
-            continue;
+        if (loc) {
+            n.layer = to_int(loc.attribute("layer"), 0);
+            n.xlow = to_int(loc.attribute("xlow"), 0);
+            n.xhigh = to_int(loc.attribute("xhigh"), n.xlow);
+            n.ylow = to_int(loc.attribute("ylow"), 0);
+            n.yhigh = to_int(loc.attribute("yhigh"), n.ylow);
+            n.ptc = to_int(loc.attribute("ptc"), -1);
         }
-        
-        const char* xhigh = loc.attribute("xhigh").value();
-        const char* xlow = loc.attribute("xlow").value();
-        const char* yhigh = loc.attribute("yhigh").value();
-        const char* ylow = loc.attribute("ylow").value();
-        
-        // Check CHANY nodes with xhigh="0" and xlow="0"
-        if (strcmp(node_type, "CHANY") == 0 && 
-            strcmp(xhigh, "0") == 0 && strcmp(xlow, "0") == 0) {
-            target_node_ids.insert(node_id);
+
+        g.max_node_id = std::max(g.max_node_id, n.id);
+        g.max_node_layer = std::max(g.max_node_layer, n.layer);
+
+        g.nodes_by_id[n.id] = n;
+        if (is_unit_node(n) && n.ptc >= 0) {
+            g.node_key_to_id[node_key(n.type, n.layer, n.xlow, n.ylow, n.ptc)] = n.id;
         }
-        // Check CHANX nodes with yhigh="0" and ylow="0"
-        else if (strcmp(node_type, "CHANX") == 0 && 
-                 strcmp(yhigh, "0") == 0 && strcmp(ylow, "0") == 0) {
-            target_node_ids.insert(node_id);
-        }
-    }
-    
-    std::cout << "Found " << target_node_ids.size() << " target nodes to process" << std::endl;
-    
-    auto scan_time = std::chrono::high_resolution_clock::now();
-    std::cout << "Node scanning completed in " 
-              << std::chrono::duration<double>(scan_time - parse_time).count() 
-              << " seconds" << std::endl;
-    
-    // Find rr_edges section and remove edges connected to target nodes
-    pugi::xml_node rr_edges = rr_graph.child("rr_edges");
-    if (!rr_edges) {
-        std::cerr << "Error: No rr_edges section found" << std::endl;
-        return false;
-    }
-    
-    // Collect edges to remove
-    std::vector<pugi::xml_node> edges_to_remove;
-    
-    for (pugi::xml_node edge = rr_edges.child("edge"); edge; edge = edge.next_sibling("edge")) {
-        const char* sink_node = edge.attribute("sink_node").value();
-        const char* src_node = edge.attribute("src_node").value();
-        
-        // Check if either sink or source node is in the target set
-        if (target_node_ids.count(sink_node) > 0 || target_node_ids.count(src_node) > 0) {
-            edges_to_remove.push_back(edge);
+        if (!g.chany_template && n.type == "CHANY") {
+            g.chany_template = node;
         }
     }
-    
-    std::cout << "Found " << edges_to_remove.size() << " edges to remove" << std::endl;
-    
-    auto edge_scan_time = std::chrono::high_resolution_clock::now();
-    std::cout << "Edge scanning completed in " 
-              << std::chrono::duration<double>(edge_scan_time - scan_time).count() 
-              << " seconds" << std::endl;
-    
-    // Remove the identified edges
-    for (pugi::xml_node& edge : edges_to_remove) {
-        rr_edges.remove_child(edge);
+
+    // Parse edges.
+    for (pugi::xml_node edge = g.rr_edges.child("edge"); edge; edge = edge.next_sibling("edge")) {
+        EdgeInfo e;
+        e.src = to_int(edge.attribute("src_node"), -1);
+        e.sink = to_int(edge.attribute("sink_node"), -1);
+        e.switch_id = to_int(edge.attribute("switch_id"), -1);
+        if (e.src >= 0 && e.sink >= 0 && e.switch_id >= 0) {
+            g.edges.push_back(e);
+        }
     }
-    
-    auto remove_time = std::chrono::high_resolution_clock::now();
-    std::cout << "Edge removal completed in " 
-              << std::chrono::duration<double>(remove_time - edge_scan_time).count() 
-              << " seconds" << std::endl;
-    
-    // Write the transformed XML to output file
-    if (!doc.save_file(output_file, "  ", pugi::format_default | pugi::format_write_bom, pugi::encoding_utf8)) {
-        std::cerr << "Error: Failed to write output file " << output_file << std::endl;
-        return false;
-    }
-    
-    auto write_time = std::chrono::high_resolution_clock::now();
-    std::cout << "XML writing completed in " 
-              << std::chrono::duration<double>(write_time - remove_time).count() 
-              << " seconds" << std::endl;
-    
-    std::cout << "\n=== Summary ===" << std::endl;
-    std::cout << "Removed " << edges_to_remove.size() << " edges" << std::endl;
-    std::cout << "Total time: " 
-              << std::chrono::duration<double>(write_time - start_time).count() 
-              << " seconds" << std::endl;
-    
+
     return true;
 }
 
-void print_usage(const char* program_name) {
-    std::cout << "Usage: " << program_name << " <input.xml> <output.xml>" << std::endl;
-    std::cout << std::endl;
-    std::cout << "Transform RR graph by removing edges connected to boundary nodes:" << std::endl;
-    std::cout << "  - CHANY nodes with xhigh=0 and xlow=0" << std::endl;
-    std::cout << "  - CHANX nodes with yhigh=0 and ylow=0" << std::endl;
+bool write_edges(ParsedGraph& g, const std::vector<EdgeInfo>& edges) {
+    // Remove all existing edge children.
+    for (pugi::xml_node edge = g.rr_edges.child("edge"); edge;) {
+        pugi::xml_node next = edge.next_sibling("edge");
+        g.rr_edges.remove_child(edge);
+        edge = next;
+    }
+
+    for (const auto& e : edges) {
+        pugi::xml_node edge = g.rr_edges.append_child("edge");
+        edge.append_attribute("sink_node").set_value(e.sink);
+        edge.append_attribute("src_node").set_value(e.src);
+        edge.append_attribute("switch_id").set_value(e.switch_id);
+    }
+    return true;
 }
 
+int infer_regular_switch_id(const ParsedGraph& g) {
+    for (const auto& e : g.edges) {
+        auto src_it = g.nodes_by_id.find(e.src);
+        auto sink_it = g.nodes_by_id.find(e.sink);
+        if (src_it == g.nodes_by_id.end() || sink_it == g.nodes_by_id.end()) continue;
+        if (is_channel_type(src_it->second.type) && is_channel_type(sink_it->second.type)) {
+            return e.switch_id;
+        }
+    }
+    return 2; // fallback in local archs
+}
+
+bool is_pe_xy(const ParsedGraph& g, int x, int y) {
+    return g.pe_tiles_xy.count(xy_key(x, y)) > 0;
+}
+
+bool is_pe_opin(const ParsedGraph& g, const NodeInfo& n) {
+    return n.type == "OPIN" && n.layer == 0 && is_unit_node(n) && is_pe_xy(g, n.xlow, n.ylow);
+}
+
+bool is_pe_ipin(const ParsedGraph& g, const NodeInfo& n) {
+    return n.type == "IPIN" && n.layer == 0 && is_unit_node(n) && is_pe_xy(g, n.xlow, n.ylow);
+}
+
+bool is_base_chany_for_pe(const ParsedGraph& g, const NodeInfo& n) {
+    if (!(n.type == "CHANY" && n.layer == 0 && is_unit_node(n) && n.ptc >= 0)) {
+        return false;
+    }
+    if (n.ylow <= 0) return false;
+    return is_pe_xy(g, n.xlow, n.ylow - 1);
+}
+
+bool is_forbidden_base_downward_edge(const ParsedGraph& g, const NodeInfo& src, const NodeInfo& sink) {
+    if (!is_base_chany_for_pe(g, src)) return false;
+    if (!(sink.layer == 0 && is_channel_type(sink.type))) return false;
+    const int pe_y = src.ylow - 1;
+    if (sink.type == "CHANY") {
+        return sink.ylow <= pe_y;
+    }
+    if (sink.type == "CHANX") {
+        return sink.ylow <= pe_y;
+    }
+    return false;
+}
+
+int pick_gate_y_for_pe_track(const ParsedGraph& g, int gate_layer, int x, int pe_y, int track) {
+    // Prefer the conceptual "router above PE" coordinate (y = pe_y + 1).
+    // In boundary rows there may be no CHANY at y+1 for this layer; in that case
+    // fall back to y = pe_y so OPIN is not rewired into an isolated gate node.
+    const int preferred_y = pe_y + 1;
+    const int id_preferred = find_node_id(g, "CHANY", gate_layer, x, preferred_y, track);
+    const int id_fallback = find_node_id(g, "CHANY", gate_layer, x, pe_y, track);
+    if (id_preferred >= 0) {
+        return preferred_y;
+    }
+    if (id_fallback >= 0) {
+        return pe_y;
+    }
+    return preferred_y;
+}
+
+int get_or_create_gate_chany_node(ParsedGraph& g, int x, int y, int track, int gate_layer, const NodeInfo* template_src) {
+    const std::string key = node_key("CHANY", gate_layer, x, y, track);
+    auto it = g.node_key_to_id.find(key);
+    if (it != g.node_key_to_id.end()) {
+        return it->second;
+    }
+
+    pugi::xml_node template_node = pugi::xml_node();
+    if (template_src && template_src->xml_node) {
+        template_node = template_src->xml_node;
+    } else if (g.chany_template) {
+        template_node = g.chany_template;
+    }
+
+    if (!template_node) {
+        return -1;
+    }
+
+    pugi::xml_node new_node = g.rr_nodes.append_copy(template_node);
+    const int new_id = ++g.max_node_id;
+
+    set_int_attr(new_node, "id", new_id);
+    set_int_attr(new_node, "capacity", 1);
+    pugi::xml_attribute type_attr = new_node.attribute("type");
+    if (!type_attr) type_attr = new_node.append_attribute("type");
+    type_attr.set_value("CHANY");
+
+    pugi::xml_node loc = new_node.child("loc");
+    if (!loc) loc = new_node.append_child("loc");
+    set_int_attr(loc, "layer", gate_layer);
+    set_int_attr(loc, "ptc", track);
+    set_int_attr(loc, "xlow", x);
+    set_int_attr(loc, "xhigh", x);
+    set_int_attr(loc, "ylow", y);
+    set_int_attr(loc, "yhigh", y);
+    // Ensure no pin-side residue on channel nodes.
+    pugi::xml_attribute side_attr = loc.attribute("side");
+    if (side_attr) {
+        loc.remove_attribute(side_attr);
+    }
+
+    NodeInfo n;
+    n.id = new_id;
+    n.type = "CHANY";
+    n.layer = gate_layer;
+    n.xlow = x;
+    n.xhigh = x;
+    n.ylow = y;
+    n.yhigh = y;
+    n.ptc = track;
+    n.capacity = 1;
+    n.xml_node = new_node;
+
+    g.nodes_by_id[new_id] = n;
+    g.node_key_to_id[key] = new_id;
+    g.max_node_layer = std::max(g.max_node_layer, gate_layer);
+    return new_id;
+}
+
+std::string edge_key(int src, int sink, int sw) {
+    std::ostringstream oss;
+    oss << src << "|" << sink << "|" << sw;
+    return oss.str();
+}
+
+void push_edge_unique(std::vector<EdgeInfo>& out_edges,
+                      std::unordered_set<std::string>& edge_seen,
+                      int src, int sink, int sw) {
+    if (src < 0 || sink < 0 || sw < 0) return;
+    const std::string key = edge_key(src, sink, sw);
+    if (edge_seen.insert(key).second) {
+        out_edges.push_back({src, sink, sw});
+    }
+}
+
+bool transform_boundary(ParsedGraph& g) {
+    std::unordered_set<int> target_node_ids;
+
+    for (const auto& kv : g.nodes_by_id) {
+        const auto& n = kv.second;
+        if (n.type == "CHANY" && n.xlow == 0 && n.xhigh == 0) {
+            target_node_ids.insert(n.id);
+        } else if (n.type == "CHANX" && n.ylow == 0 && n.yhigh == 0) {
+            target_node_ids.insert(n.id);
+        }
+    }
+
+    std::vector<EdgeInfo> new_edges;
+    new_edges.reserve(g.edges.size());
+    for (const auto& e : g.edges) {
+        if (target_node_ids.count(e.src) > 0 || target_node_ids.count(e.sink) > 0) continue;
+        new_edges.push_back(e);
+    }
+
+    std::cout << "boundary mode: target nodes=" << target_node_ids.size()
+              << ", removed edges=" << (g.edges.size() - new_edges.size()) << "\n";
+
+    return write_edges(g, new_edges);
+}
+
+bool transform_cerebras(ParsedGraph& g, int gate_layer) {
+    const int regular_switch = infer_regular_switch_id(g);
+
+    if (gate_layer > g.max_grid_layer) {
+        std::cout << "Warning: requested gate layer " << gate_layer
+                  << " exceeds max grid layer " << g.max_grid_layer
+                  << ". Clamping gate layer to " << g.max_grid_layer << ".\n";
+        gate_layer = g.max_grid_layer;
+    }
+
+    std::unordered_map<int, int> base_to_gate;            // base CHANY node id -> gate node id
+    std::unordered_set<int> gate_node_ids;                // ids of all gate nodes used/created
+    std::vector<RemovedEdgeInfo> removed_r4_edges;        // for re-attachment from gate
+
+    std::vector<EdgeInfo> kept_edges;
+    kept_edges.reserve(g.edges.size());
+
+    size_t removed_r2 = 0;
+    size_t removed_r3 = 0;
+    size_t removed_r4 = 0;
+    size_t added_pin_to_gate = 0;
+
+    // First pass: remove/collect according to R2/R3/R4, build direct pin<->gate rewires.
+    for (const auto& e : g.edges) {
+        auto src_it = g.nodes_by_id.find(e.src);
+        auto sink_it = g.nodes_by_id.find(e.sink);
+        if (src_it == g.nodes_by_id.end() || sink_it == g.nodes_by_id.end()) {
+            continue;
+        }
+        const NodeInfo& src = src_it->second;
+        const NodeInfo& sink = sink_it->second;
+
+        bool remove = false;
+
+        // R2: remove OPIN->CHAN* bypass, add OPIN->gate.
+        if (is_pe_opin(g, src) && is_channel_type(sink.type) && sink.layer == 0) {
+            int gx = src.xlow;
+            int gtrack = sink.ptc;
+            int gy = pick_gate_y_for_pe_track(g, gate_layer, gx, src.ylow, gtrack);
+            int gate_id = get_or_create_gate_chany_node(g, gx, gy, gtrack, gate_layer, &sink);
+            if (gate_id >= 0) {
+                gate_node_ids.insert(gate_id);
+                // preserve switch class from original OPIN edge
+                kept_edges.push_back({src.id, gate_id, e.switch_id});
+                added_pin_to_gate++;
+            }
+            remove = true;
+            removed_r2++;
+        }
+
+        // R3: remove CHAN*->IPIN bypass, add gate->IPIN.
+        if (!remove && is_channel_type(src.type) && src.layer == 0 && is_pe_ipin(g, sink)) {
+            int gx = sink.xlow;
+            int gtrack = src.ptc;
+            int gy = pick_gate_y_for_pe_track(g, gate_layer, gx, sink.ylow, gtrack);
+            int gate_id = get_or_create_gate_chany_node(g, gx, gy, gtrack, gate_layer, &src);
+            if (gate_id >= 0) {
+                gate_node_ids.insert(gate_id);
+                // preserve switch class from original IPIN edge
+                kept_edges.push_back({gate_id, sink.id, e.switch_id});
+                added_pin_to_gate++;
+            }
+            remove = true;
+            removed_r3++;
+        }
+
+        // R4: remove forbidden downward base-CHANY transitions and record for gate reattach.
+        if (!remove && is_forbidden_base_downward_edge(g, src, sink)) {
+            int gate_id = -1;
+            auto bg_it = base_to_gate.find(src.id);
+            if (bg_it != base_to_gate.end()) {
+                gate_id = bg_it->second;
+            } else {
+                gate_id = get_or_create_gate_chany_node(g, src.xlow, src.ylow, src.ptc, gate_layer, &src);
+                if (gate_id >= 0) {
+                    base_to_gate[src.id] = gate_id;
+                    gate_node_ids.insert(gate_id);
+                }
+            }
+
+            removed_r4_edges.push_back({src.id, sink.id, e.switch_id});
+            remove = true;
+            removed_r4++;
+        }
+
+        if (!remove) {
+            kept_edges.push_back(e);
+        }
+    }
+
+    // R5: mandatory base->gate handoff.
+    for (const auto& kv : base_to_gate) {
+        int base_id = kv.first;
+        int gate_id = kv.second;
+        if (base_id == gate_id) continue;
+        kept_edges.push_back({base_id, gate_id, regular_switch});
+        gate_node_ids.insert(gate_id);
+    }
+
+    // R6 (+ user requested adjustment): reconnect removed R4 destinations from gate.
+    size_t reattached_from_gate = 0;
+    for (const auto& r : removed_r4_edges) {
+        auto bg_it = base_to_gate.find(r.base_src);
+        if (bg_it == base_to_gate.end()) continue;
+        const int gate_id = bg_it->second;
+        kept_edges.push_back({gate_id, r.dst, r.switch_id});
+        reattached_from_gate++;
+    }
+
+    // R7: global bypass cleanup pass.
+    std::vector<EdgeInfo> cleaned_edges;
+    cleaned_edges.reserve(kept_edges.size());
+
+    size_t removed_r7 = 0;
+    for (const auto& e : kept_edges) {
+        auto src_it = g.nodes_by_id.find(e.src);
+        auto sink_it = g.nodes_by_id.find(e.sink);
+        if (src_it == g.nodes_by_id.end() || sink_it == g.nodes_by_id.end()) {
+            continue;
+        }
+        const NodeInfo& src = src_it->second;
+        const NodeInfo& sink = sink_it->second;
+
+        bool remove = false;
+
+        // Remove residual OPIN->CHAN* bypasses unless sink is a gate node.
+        if (is_pe_opin(g, src) && is_channel_type(sink.type) && sink.layer == 0) {
+            if (gate_node_ids.count(sink.id) == 0) {
+                remove = true;
+            }
+        }
+
+        // Remove residual CHAN*->IPIN bypasses unless src is a gate node.
+        if (!remove && is_channel_type(src.type) && src.layer == 0 && is_pe_ipin(g, sink)) {
+            if (gate_node_ids.count(src.id) == 0) {
+                remove = true;
+            }
+        }
+
+        // Remove residual forbidden downward base edges unless this is the handoff edge to gate.
+        if (!remove && is_forbidden_base_downward_edge(g, src, sink)) {
+            auto bg_it = base_to_gate.find(src.id);
+            if (bg_it == base_to_gate.end() || sink.id != bg_it->second) {
+                remove = true;
+            }
+        }
+
+        if (remove) {
+            removed_r7++;
+            continue;
+        }
+
+        cleaned_edges.push_back(e);
+    }
+
+    // Final deduplication.
+    std::vector<EdgeInfo> dedup_edges;
+    dedup_edges.reserve(cleaned_edges.size());
+    std::unordered_set<std::string> seen;
+    for (const auto& e : cleaned_edges) {
+        push_edge_unique(dedup_edges, seen, e.src, e.sink, e.switch_id);
+    }
+
+    std::cout << "cerebras mode summary:\n"
+              << "  removed R2 (OPIN bypass): " << removed_r2 << "\n"
+              << "  removed R3 (IPIN bypass): " << removed_r3 << "\n"
+              << "  removed R4 (base-downward): " << removed_r4 << "\n"
+              << "  added pin<->gate rewires: " << added_pin_to_gate << "\n"
+              << "  added base->gate handoff: " << base_to_gate.size() << "\n"
+              << "  reattached from gate (R6): " << reattached_from_gate << "\n"
+              << "  removed in global cleanup (R7): " << removed_r7 << "\n"
+              << "  gate nodes tracked: " << gate_node_ids.size() << "\n"
+              << "  edges out: " << dedup_edges.size() << "\n";
+
+    return write_edges(g, dedup_edges);
+}
+
+TransformMode parse_mode(const std::string& mode_str) {
+    if (mode_str == "boundary") return TransformMode::kBoundary;
+    if (mode_str == "cerebras") return TransformMode::kCerebras;
+    throw std::runtime_error("Unknown mode: " + mode_str);
+}
+
+void print_usage(const char* program_name) {
+    std::cout << "Usage:\n"
+              << "  " << program_name << " <input.xml> <output.xml>\n"
+              << "  " << program_name << " --mode <boundary|cerebras> <input.xml> <output.xml>\n"
+              << "  " << program_name << " --mode cerebras --gate-layer <N> <input.xml> <output.xml>\n\n"
+              << "Modes:\n"
+              << "  boundary  Legacy boundary CHAN pruning (default)\n"
+              << "  cerebras  Gate-mediated rewiring + global bypass cleanup\n";
+}
+
+bool transform_rr_graph(const char* input_file, const char* output_file, TransformMode mode, int gate_layer) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    ParsedGraph g;
+    if (!parse_graph(input_file, g)) {
+        return false;
+    }
+
+    auto parse_time = std::chrono::high_resolution_clock::now();
+    std::cout << "XML parsing/indexing completed in "
+              << std::chrono::duration<double>(parse_time - start_time).count()
+              << " seconds\n";
+    std::cout << "Parsed nodes=" << g.nodes_by_id.size() << ", edges=" << g.edges.size()
+              << ", pe_tiles=" << g.pe_tiles_xy.size()
+              << ", max_grid_layer=" << g.max_grid_layer
+              << ", max_node_layer=" << g.max_node_layer << "\n";
+
+    bool ok = false;
+    if (mode == TransformMode::kBoundary) {
+        ok = transform_boundary(g);
+    } else {
+        ok = transform_cerebras(g, gate_layer);
+    }
+    if (!ok) return false;
+
+    if (!g.doc.save_file(output_file, "  ", pugi::format_default | pugi::format_write_bom, pugi::encoding_utf8)) {
+        std::cerr << "Error: Failed to write output file " << output_file << "\n";
+        return false;
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::cout << "Total transform time: "
+              << std::chrono::duration<double>(end_time - start_time).count()
+              << " seconds\n";
+    return true;
+}
+
+} // namespace
+
 int main(int argc, char** argv) {
-    if (argc != 3) {
+    if (argc < 3) {
         print_usage(argv[0]);
         return 1;
     }
-    
-    const char* input_file = argv[1];
-    const char* output_file = argv[2];
-    
-    std::cout << "RR Graph Transform Tool" << std::endl;
-    std::cout << "Input:  " << input_file << std::endl;
-    std::cout << "Output: " << output_file << std::endl;
-    std::cout << std::endl;
-    
-    if (transform_rr_graph(input_file, output_file)) {
-        std::cout << "\nTransformation completed successfully!" << std::endl;
-        return 0;
-    } else {
-        std::cerr << "\nTransformation failed!" << std::endl;
+
+    std::string mode_str = "boundary";
+    int gate_layer = 1;
+
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--mode") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --mode requires a value\n";
+                return 1;
+            }
+            mode_str = argv[++i];
+        } else if (arg == "--gate-layer") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --gate-layer requires a value\n";
+                return 1;
+            }
+            gate_layer = std::atoi(argv[++i]);
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "Error: Unknown option " << arg << "\n";
+            return 1;
+        } else {
+            positional.push_back(arg);
+        }
+    }
+
+    if (positional.size() != 2) {
+        print_usage(argv[0]);
         return 1;
     }
-}
 
+    TransformMode mode;
+    try {
+        mode = parse_mode(mode_str);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\n";
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    const char* input_file = positional[0].c_str();
+    const char* output_file = positional[1].c_str();
+
+    std::cout << "RR Graph Transform Tool\n";
+    std::cout << "Mode:   " << mode_str << "\n";
+    std::cout << "Input:  " << input_file << "\n";
+    std::cout << "Output: " << output_file << "\n";
+    if (mode == TransformMode::kCerebras) {
+        std::cout << "Gate layer: " << gate_layer << "\n";
+    }
+    std::cout << "\n";
+
+    if (transform_rr_graph(input_file, output_file, mode, gate_layer)) {
+        std::cout << "Transformation completed successfully!\n";
+        return 0;
+    }
+
+    std::cerr << "Transformation failed!\n";
+    return 1;
+}

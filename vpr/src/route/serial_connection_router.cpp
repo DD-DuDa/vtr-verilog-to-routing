@@ -350,7 +350,7 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
     // === CUSTOM ILLEGAL-PATTERN PRUNING (enable when needed) ===
     // Set this to true to activate the constraints
     // printf("Using serial_connection_router.cpp\n"); // we use this for routing
-    static constexpr bool k_enable_track_constraints = true;
+    static constexpr bool k_enable_track_constraints = false;
     // Heuristic broadcast routing already pins OPIN fanout to a fixed track.
     // Skip the custom illegal-pattern pruning for these nets so VPR can take
     // the most direct legal path on the forced track.
