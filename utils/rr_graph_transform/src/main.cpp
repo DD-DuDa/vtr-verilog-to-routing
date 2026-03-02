@@ -260,37 +260,95 @@ bool is_base_chany_for_pe(const ParsedGraph& g, const NodeInfo& n) {
     if (!(n.type == "CHANY" && n.layer == 0 && is_unit_node(n) && n.ptc >= 0)) {
         return false;
     }
-    if (n.ylow <= 0) return false;
-    return is_pe_xy(g, n.xlow, n.ylow - 1);
+    return is_pe_xy(g, n.xlow, n.ylow);
+}
+
+bool is_base_chanx_for_pe(const ParsedGraph& g, const NodeInfo& n) {
+    if (!(n.type == "CHANX" && n.layer == 0 && is_unit_node(n) && n.ptc >= 0)) {
+        return false;
+    }
+    return is_pe_xy(g, n.xlow, n.ylow);
 }
 
 bool is_forbidden_base_downward_edge(const ParsedGraph& g, const NodeInfo& src, const NodeInfo& sink) {
     if (!is_base_chany_for_pe(g, src)) return false;
     if (!(sink.layer == 0 && is_channel_type(sink.type))) return false;
-    const int pe_y = src.ylow - 1;
+    // Keep boundary escape edges toward IO-side channels.
+    if (!is_pe_xy(g, sink.xlow, sink.ylow)) return false;
+    const int base_y = src.ylow;
     if (sink.type == "CHANY") {
-        return sink.ylow <= pe_y;
+        // Forbid base->CHANY to row above, and also forbid base->CHANY(b-1,0).
+        return sink.ylow >= (base_y + 1) || sink.ylow == (base_y - 1);
     }
     if (sink.type == "CHANX") {
-        return sink.ylow <= pe_y;
+        // Prune CHANX at y>=b and y==b-1 (i.e., prune CHANX at y>=b-1).
+        return sink.ylow >= (base_y - 1);
     }
     return false;
 }
 
-int pick_gate_y_for_pe_track(const ParsedGraph& g, int gate_layer, int x, int pe_y, int track) {
-    // Prefer the conceptual "router above PE" coordinate (y = pe_y + 1).
-    // In boundary rows there may be no CHANY at y+1 for this layer; in that case
-    // fall back to y = pe_y so OPIN is not rewired into an isolated gate node.
-    const int preferred_y = pe_y + 1;
-    const int id_preferred = find_node_id(g, "CHANY", gate_layer, x, preferred_y, track);
-    const int id_fallback = find_node_id(g, "CHANY", gate_layer, x, pe_y, track);
-    if (id_preferred >= 0) {
-        return preferred_y;
+bool is_forbidden_base_chanx_r7_edge(const ParsedGraph& g, const NodeInfo& src, const NodeInfo& sink) {
+    if (!is_base_chanx_for_pe(g, src)) return false;
+    if (sink.ptc != src.ptc) return false;
+    // Keep boundary escape edges toward IO-side channels.
+    if (is_channel_type(sink.type) && sink.layer == 0 && !is_pe_xy(g, sink.xlow, sink.ylow)) {
+        return false;
     }
-    if (id_fallback >= 0) {
-        return pe_y;
+
+    // Prune any base CHANX(a,b,t) -> CHANY(*,*,t) on layer 0.
+    if (sink.type == "CHANY" && sink.layer == 0) {
+        return true;
     }
-    return preferred_y;
+
+    // Prune lateral same-row immediate neighbors on CHANX.
+    if (sink.type == "CHANX" && sink.layer == 0 && is_unit_node(sink) && sink.ylow == src.ylow) {
+        return (sink.xlow == src.xlow - 1) || (sink.xlow == src.xlow + 1);
+    }
+
+    return false;
+}
+
+bool is_allowed_base_chany_gate_sink(const ParsedGraph& g, const NodeInfo& src, int sink_id, int gate_layer) {
+    if (!is_base_chany_for_pe(g, src)) return false;
+    int g0 = find_node_id(g, "CHANY", gate_layer, src.xlow, src.ylow, src.ptc);
+    if (sink_id == g0) return true;
+    if (src.ylow > 0) {
+        int g1 = find_node_id(g, "CHANY", gate_layer, src.xlow, src.ylow - 1, src.ptc);
+        if (sink_id == g1) return true;
+    }
+    return false;
+}
+
+bool is_allowed_base_chanx_gate_sink(const ParsedGraph& g, const NodeInfo& src, int sink_id, int gate_layer) {
+    if (!is_base_chanx_for_pe(g, src)) return false;
+    int g0 = find_node_id(g, "CHANY", gate_layer, src.xlow, src.ylow, src.ptc);
+    if (sink_id == g0) return true;
+    if (src.xlow > 0) {
+        int g1 = find_node_id(g, "CHANY", gate_layer, src.xlow - 1, src.ylow, src.ptc);
+        if (sink_id == g1) return true;
+    }
+    return false;
+}
+
+bool should_reattach_removed_edge_from_primary_gate(const NodeInfo& base, const NodeInfo& dst) {
+    if (!(dst.layer == 0 && is_channel_type(dst.type))) return false;
+    if (!is_unit_node(base) || !is_unit_node(dst)) return false;
+
+    const int base_y = base.ylow;
+    if (dst.type == "CHANX") {
+        return dst.ylow >= base_y;
+    }
+    if (dst.type == "CHANY") {
+        return dst.xlow == base.xlow
+               && (dst.ylow >= (base_y + 1) || dst.ylow == (base_y - 1));
+    }
+    return false;
+}
+
+int fixed_gate_y_for_pe_track(int pe_y) {
+    // User policy: gate location is fixed at CHANY(a, b, gate_layer, track),
+    // where PE is at (a, b, 0). No y+1 / y-1 fallback.
+    return pe_y;
 }
 
 int get_or_create_gate_chany_node(ParsedGraph& g, int x, int y, int track, int gate_layer, const NodeInfo* template_src) {
@@ -413,9 +471,11 @@ bool transform_cerebras(ParsedGraph& g, int gate_layer) {
     size_t removed_r2 = 0;
     size_t removed_r3 = 0;
     size_t removed_r4 = 0;
+    size_t removed_r7_base_chanx = 0;
     size_t added_pin_to_gate = 0;
 
-    // First pass: remove/collect according to R2/R3/R4, build direct pin<->gate rewires.
+    // First pass: apply channel pruning rules (R4/R7) and add direct pin<->gate rewires.
+    // User policy: keep all original pin-connected edges (do not prune OPIN/IPIN edges).
     for (const auto& e : g.edges) {
         auto src_it = g.nodes_by_id.find(e.src);
         auto sink_it = g.nodes_by_id.find(e.sink);
@@ -427,11 +487,11 @@ bool transform_cerebras(ParsedGraph& g, int gate_layer) {
 
         bool remove = false;
 
-        // R2: remove OPIN->CHAN* bypass, add OPIN->gate.
+        // R2: PE OPIN must handoff via gate (no direct PE OPIN->CHAN*).
         if (is_pe_opin(g, src) && is_channel_type(sink.type) && sink.layer == 0) {
             int gx = src.xlow;
             int gtrack = sink.ptc;
-            int gy = pick_gate_y_for_pe_track(g, gate_layer, gx, src.ylow, gtrack);
+            int gy = fixed_gate_y_for_pe_track(src.ylow);
             int gate_id = get_or_create_gate_chany_node(g, gx, gy, gtrack, gate_layer, &sink);
             if (gate_id >= 0) {
                 gate_node_ids.insert(gate_id);
@@ -443,11 +503,11 @@ bool transform_cerebras(ParsedGraph& g, int gate_layer) {
             removed_r2++;
         }
 
-        // R3: remove CHAN*->IPIN bypass, add gate->IPIN.
+        // R3: PE IPIN must be driven via gate (no direct layer0 CHAN*->PE IPIN).
         if (!remove && is_channel_type(src.type) && src.layer == 0 && is_pe_ipin(g, sink)) {
             int gx = sink.xlow;
             int gtrack = src.ptc;
-            int gy = pick_gate_y_for_pe_track(g, gate_layer, gx, sink.ylow, gtrack);
+            int gy = fixed_gate_y_for_pe_track(sink.ylow);
             int gate_id = get_or_create_gate_chany_node(g, gx, gy, gtrack, gate_layer, &src);
             if (gate_id >= 0) {
                 gate_node_ids.insert(gate_id);
@@ -478,35 +538,143 @@ bool transform_cerebras(ParsedGraph& g, int gate_layer) {
             removed_r4++;
         }
 
+        // R7 (new): for base CHANX(a,b,t), remove forbidden CHANX/CHANY edges.
+        if (!remove && is_forbidden_base_chanx_r7_edge(g, src, sink)) {
+            remove = true;
+            removed_r7_base_chanx++;
+        }
+
         if (!remove) {
             kept_edges.push_back(e);
         }
     }
 
     // R5: mandatory base->gate handoff.
+    size_t added_base_to_down_gate = 0;
     for (const auto& kv : base_to_gate) {
         int base_id = kv.first;
         int gate_id = kv.second;
         if (base_id == gate_id) continue;
         kept_edges.push_back({base_id, gate_id, regular_switch});
         gate_node_ids.insert(gate_id);
+
+        auto base_it = g.nodes_by_id.find(base_id);
+        if (base_it == g.nodes_by_id.end()) continue;
+        const NodeInfo& base = base_it->second;
+        if (!is_unit_node(base)) continue;
+        if (base.ylow <= 0) continue;
+
+        int down_gate_id = get_or_create_gate_chany_node(g, base.xlow, base.ylow - 1, base.ptc, gate_layer, &base);
+        if (down_gate_id < 0) continue;
+
+        kept_edges.push_back({base_id, down_gate_id, regular_switch});
+        gate_node_ids.insert(down_gate_id);
+        added_base_to_down_gate++;
     }
 
-    // R6 (+ user requested adjustment): reconnect removed R4 destinations from gate.
+    // R6: reconnect selected removed R4 destinations from primary gate.
     size_t reattached_from_gate = 0;
+    size_t skipped_r6 = 0;
     for (const auto& r : removed_r4_edges) {
         auto bg_it = base_to_gate.find(r.base_src);
         if (bg_it == base_to_gate.end()) continue;
         const int gate_id = bg_it->second;
+
+        auto base_it = g.nodes_by_id.find(r.base_src);
+        auto dst_it = g.nodes_by_id.find(r.dst);
+        if (base_it == g.nodes_by_id.end() || dst_it == g.nodes_by_id.end()) {
+            continue;
+        }
+        const NodeInfo& base = base_it->second;
+        const NodeInfo& dst = dst_it->second;
+
+        if (!should_reattach_removed_edge_from_primary_gate(base, dst)) {
+            skipped_r6++;
+            continue;
+        }
+
         kept_edges.push_back({gate_id, r.dst, r.switch_id});
         reattached_from_gate++;
     }
 
-    // R7: global bypass cleanup pass.
+    // R6.5: enforce gate<->layer0-channel coupling at (x,y,ptc) and
+    // immediate positive neighbors used by the gate fabric:
+    //   gate(a,b,t) <-> CHANX(a,b,t), CHANX(a+1,b,t), CHANY(a,b,t), CHANY(a,b+1,t)
+    size_t added_local_gate_links = 0;
+    for (int gate_id : gate_node_ids) {
+        const auto gate_it = g.nodes_by_id.find(gate_id);
+        if (gate_it == g.nodes_by_id.end()) continue;
+        const NodeInfo& gate = gate_it->second;
+        if (gate.layer != gate_layer || !is_unit_node(gate) || gate.ptc < 0) continue;
+
+        const int chany0 = find_node_id(g, "CHANY", 0, gate.xlow, gate.ylow, gate.ptc);
+        if (chany0 >= 0) {
+            kept_edges.push_back({gate_id, chany0, regular_switch});
+            kept_edges.push_back({chany0, gate_id, regular_switch});
+            added_local_gate_links += 2;
+        }
+
+        const int chanx0 = find_node_id(g, "CHANX", 0, gate.xlow, gate.ylow, gate.ptc);
+        if (chanx0 >= 0) {
+            kept_edges.push_back({gate_id, chanx0, regular_switch});
+            kept_edges.push_back({chanx0, gate_id, regular_switch});
+            added_local_gate_links += 2;
+        }
+
+        const int chany0_up = find_node_id(g, "CHANY", 0, gate.xlow, gate.ylow + 1, gate.ptc);
+        if (chany0_up >= 0) {
+            kept_edges.push_back({gate_id, chany0_up, regular_switch});
+            kept_edges.push_back({chany0_up, gate_id, regular_switch});
+            added_local_gate_links += 2;
+        }
+
+        const int chanx0_right = find_node_id(g, "CHANX", 0, gate.xlow + 1, gate.ylow, gate.ptc);
+        if (chanx0_right >= 0) {
+            kept_edges.push_back({gate_id, chanx0_right, regular_switch});
+            kept_edges.push_back({chanx0_right, gate_id, regular_switch});
+            added_local_gate_links += 2;
+        }
+    }
+
+    // R7 (new): base CHANX handoff to gate(a,b,t) and gate(a-1,b,t).
+    size_t added_base_chanx_to_gate = 0;
+    size_t added_base_chanx_to_left_gate = 0;
+    std::vector<int> base_chanx_ids;
+    base_chanx_ids.reserve(g.nodes_by_id.size());
+    for (const auto& kv : g.nodes_by_id) {
+        if (is_base_chanx_for_pe(g, kv.second)) {
+            base_chanx_ids.push_back(kv.first);
+        }
+    }
+    for (int base_id : base_chanx_ids) {
+        auto it = g.nodes_by_id.find(base_id);
+        if (it == g.nodes_by_id.end()) continue;
+        const NodeInfo& base_cx = it->second;
+
+        int gate_id = get_or_create_gate_chany_node(g, base_cx.xlow, base_cx.ylow, base_cx.ptc, gate_layer, nullptr);
+        if (gate_id >= 0) {
+            kept_edges.push_back({base_cx.id, gate_id, regular_switch});
+            gate_node_ids.insert(gate_id);
+            added_base_chanx_to_gate++;
+        }
+
+        if (base_cx.xlow > 0) {
+            int left_gate_id = get_or_create_gate_chany_node(g, base_cx.xlow - 1, base_cx.ylow, base_cx.ptc, gate_layer, nullptr);
+            if (left_gate_id >= 0) {
+                kept_edges.push_back({base_cx.id, left_gate_id, regular_switch});
+                gate_node_ids.insert(left_gate_id);
+                added_base_chanx_to_left_gate++;
+            }
+        }
+    }
+
+    // R8: global bypass cleanup pass.
     std::vector<EdgeInfo> cleaned_edges;
     cleaned_edges.reserve(kept_edges.size());
 
-    size_t removed_r7 = 0;
+    size_t removed_r8 = 0;
+    size_t removed_r8_base_exact = 0;
+    size_t removed_r8_pin_exact = 0;
     for (const auto& e : kept_edges) {
         auto src_it = g.nodes_by_id.find(e.src);
         auto sink_it = g.nodes_by_id.find(e.sink);
@@ -518,17 +686,82 @@ bool transform_cerebras(ParsedGraph& g, int gate_layer) {
 
         bool remove = false;
 
-        // Remove residual OPIN->CHAN* bypasses unless sink is a gate node.
-        if (is_pe_opin(g, src) && is_channel_type(sink.type) && sink.layer == 0) {
-            if (gate_node_ids.count(sink.id) == 0) {
+        const bool src_is_gate = gate_node_ids.count(src.id) > 0;
+        const bool sink_is_gate = gate_node_ids.count(sink.id) > 0;
+
+        // Strict gate policy for multi-layer mode:
+        // apply allowlist only to edges incident to our inserted gate nodes.
+        // Keep non-gate layer-1 edges unchanged (needed for IO RR-graph validity).
+        if (gate_layer > 0 && (src_is_gate || sink_is_gate)) {
+            bool allow = false;
+
+            // Hard ban CHANX on gate layer in transformed routing usage.
+            if ((src.layer == gate_layer && src.type == "CHANX")
+                || (sink.layer == gate_layer && sink.type == "CHANX")) {
+                allow = false;
+            } else
+            if (is_pe_opin(g, src) && sink_is_gate) {
+                allow = true;
+            } else if (src_is_gate && is_pe_ipin(g, sink)) {
+                allow = true;
+            } else if (is_channel_type(src.type) && src.layer == 0 && sink_is_gate
+                       && is_unit_node(src) && is_unit_node(sink)
+                       && src.xlow == sink.xlow && src.ylow == sink.ylow + 1) {
+                // Allow base CHANY(a,b,0)->down gate CHANY(a,b-1,1) handoff edge.
+                allow = true;
+            } else if (src.type == "CHANX" && src.layer == 0 && sink_is_gate
+                       && is_unit_node(src) && is_unit_node(sink)
+                       && src.ptc == sink.ptc
+                       && src.xlow == sink.xlow + 1 && src.ylow == sink.ylow) {
+                // Allow base CHANX(a,b,0,t)->left gate(a-1,b,1,t) handoff edge (R7).
+                allow = true;
+            } else if (src_is_gate && sink.layer == 0 && is_channel_type(sink.type)
+                       && is_unit_node(src) && is_unit_node(sink)
+                       && src.ptc == sink.ptc
+                       && ((sink.type == "CHANY" && sink.xlow == src.xlow
+                            && (sink.ylow == src.ylow || sink.ylow == src.ylow + 1))
+                           || (sink.type == "CHANX" && sink.ylow == src.ylow
+                               && (sink.xlow == src.xlow || sink.xlow == src.xlow + 1)))) {
+                allow = true;
+            } else if (sink_is_gate && src.layer == 0 && is_channel_type(src.type)
+                       && is_unit_node(src) && is_unit_node(sink)
+                       && src.ptc == sink.ptc
+                       && ((src.type == "CHANY" && src.xlow == sink.xlow
+                            && (src.ylow == sink.ylow || src.ylow == sink.ylow + 1))
+                           || (src.type == "CHANX" && src.ylow == sink.ylow
+                               && (src.xlow == sink.xlow || src.xlow == sink.xlow + 1)))) {
+                allow = true;
+            }
+
+            if (!allow) {
                 remove = true;
             }
         }
 
-        // Remove residual CHAN*->IPIN bypasses unless src is a gate node.
-        if (!remove && is_channel_type(src.type) && src.layer == 0 && is_pe_ipin(g, sink)) {
-            if (gate_node_ids.count(src.id) == 0) {
+        // User policy: keep all pin-connected edges; do not enforce pin-only-through-gate.
+
+        // Strict base policy requested by user:
+        // base CHANY(a,b,0,t) -> {gate(a,b,1,t), gate(a,b-1,1,t)} only.
+        if (!remove && is_base_chany_for_pe(g, src) && sink.type != "IPIN" && sink.type != "OPIN") {
+            // Keep boundary escape edges from base channels to IO-side channels.
+            if (sink.layer == 0 && is_channel_type(sink.type) && !is_pe_xy(g, sink.xlow, sink.ylow)) {
+                // keep
+            } else
+            if (!is_allowed_base_chany_gate_sink(g, src, sink.id, gate_layer)) {
                 remove = true;
+                removed_r8_base_exact++;
+            }
+        }
+
+        // base CHANX(a,b,0,t) -> {gate(a,b,1,t), gate(a-1,b,1,t)} only.
+        if (!remove && is_base_chanx_for_pe(g, src) && sink.type != "IPIN" && sink.type != "OPIN") {
+            // Keep boundary escape edges from base channels to IO-side channels.
+            if (sink.layer == 0 && is_channel_type(sink.type) && !is_pe_xy(g, sink.xlow, sink.ylow)) {
+                // keep
+            } else
+            if (!is_allowed_base_chanx_gate_sink(g, src, sink.id, gate_layer)) {
+                remove = true;
+                removed_r8_base_exact++;
             }
         }
 
@@ -540,8 +773,29 @@ bool transform_cerebras(ParsedGraph& g, int gate_layer) {
             }
         }
 
+        // Remove residual forbidden base CHANX edges globally (R7 policy).
+        if (!remove && is_forbidden_base_chanx_r7_edge(g, src, sink)) {
+            remove = true;
+        }
+
+        // Enforce PE OPIN gate-only policy:
+        // remove any residual direct PE OPIN->layer0 CHAN* edges.
+        if (!remove && src.type == "OPIN" && src.layer == 0
+            && is_pe_xy(g, src.xlow, src.ylow)
+            && sink.layer == 0 && is_channel_type(sink.type)) {
+            remove = true;
+        }
+
+        // Enforce PE IPIN gate-only policy:
+        // remove any residual direct layer0 CHAN*->PE IPIN edges.
+        if (!remove && sink.type == "IPIN" && sink.layer == 0
+            && is_pe_xy(g, sink.xlow, sink.ylow)
+            && src.layer == 0 && is_channel_type(src.type)) {
+            remove = true;
+        }
+
         if (remove) {
-            removed_r7++;
+            removed_r8++;
             continue;
         }
 
@@ -560,10 +814,18 @@ bool transform_cerebras(ParsedGraph& g, int gate_layer) {
               << "  removed R2 (OPIN bypass): " << removed_r2 << "\n"
               << "  removed R3 (IPIN bypass): " << removed_r3 << "\n"
               << "  removed R4 (base-downward): " << removed_r4 << "\n"
+              << "  removed R7 (base CHANX forbidden edges): " << removed_r7_base_chanx << "\n"
               << "  added pin<->gate rewires: " << added_pin_to_gate << "\n"
               << "  added base->gate handoff: " << base_to_gate.size() << "\n"
+              << "  added base->down_gate handoff (R5): " << added_base_to_down_gate << "\n"
               << "  reattached from gate (R6): " << reattached_from_gate << "\n"
-              << "  removed in global cleanup (R7): " << removed_r7 << "\n"
+              << "  skipped reattach in R6: " << skipped_r6 << "\n"
+              << "  added local gate links (R6.5): " << added_local_gate_links << "\n"
+              << "  added base CHANX->gate handoff (R7): " << added_base_chanx_to_gate << "\n"
+              << "  added base CHANX->left_gate handoff (R7): " << added_base_chanx_to_left_gate << "\n"
+              << "  removed by strict base exact policy (R8): " << removed_r8_base_exact << "\n"
+              << "  removed by strict pin policy (R8): " << removed_r8_pin_exact << "\n"
+              << "  removed in global cleanup (R8): " << removed_r8 << "\n"
               << "  gate nodes tracked: " << gate_node_ids.size() << "\n"
               << "  edges out: " << dedup_edges.size() << "\n";
 

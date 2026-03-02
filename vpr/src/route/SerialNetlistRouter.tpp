@@ -17,8 +17,8 @@ inline RouteIterResults SerialNetlistRouter<HeapType>::route_netlist(int itry, f
 
     vtr::Timer timer;
 
+#if 0 /* [TETRIS CUSTOM DISABLED: broadcast-first net ordering] */
     /* Sort so broadcast/multicast nets are routed first, then by sink count */
-    auto sorted_nets = std::vector<ParentNetId>(_net_list.nets().begin(), _net_list.nets().end());
     std::stable_sort(sorted_nets.begin(), sorted_nets.end(), [&](ParentNetId id1, ParentNetId id2) -> bool {
         // Check if nets are broadcast/multicast (contain "bcast" in name)
         std::string name1 = _net_list.net_name(id1);
@@ -43,7 +43,13 @@ inline RouteIterResults SerialNetlistRouter<HeapType>::route_netlist(int itry, f
                     _net_list.net_sinks(sorted_nets[i]).size());
         }
     }
+#endif /* [TETRIS CUSTOM DISABLED: broadcast-first net ordering] */
 
+    /* Original VTR behavior: sort by sink count descending (most sinks first) */
+    auto sorted_nets = std::vector<ParentNetId>(_net_list.nets().begin(), _net_list.nets().end());
+    std::stable_sort(sorted_nets.begin(), sorted_nets.end(), [&](ParentNetId id1, ParentNetId id2) -> bool {
+        return _net_list.net_sinks(id1).size() > _net_list.net_sinks(id2).size();
+    });
     for (size_t inet = 0; inet < sorted_nets.size(); inet++) {
         ParentNetId net_id = sorted_nets[inet];
         NetResultFlags flags = route_net(

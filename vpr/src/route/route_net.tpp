@@ -22,6 +22,7 @@
 #include "spatial_route_tree_lookup.h"
 #include "vtr_dynamic_bitset.h"
 
+#if 0 /* [TETRIS CUSTOM DISABLED: multicast helper functions] */
 /** Helper function to get all candidate tracks from OPIN node
  * Returns a vector of (track_number, congestion_score) pairs, sorted by congestion (lower is better)
  * This is used to intelligently select tracks for multicast nets */
@@ -182,6 +183,7 @@ inline std::unordered_map<RRNodeId, int> extract_opin_tracks_from_route_tree(con
     traverse(tree.root());
     return opin_tracks;
 }
+#endif /* [TETRIS CUSTOM DISABLED: multicast helper functions] */
 
 inline bool is_heuristic_bcast_net_name(const std::string& net_name) {
     static const bool k_heuristic_routing = []() {
@@ -380,6 +382,7 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
                                                         is_flat);
     }
 
+#if 0 /* [TETRIS CUSTOM DISABLED: multicast detection + heuristic sink ordering] */
     // Check if this is a multicast/broadcast net
     std::string net_name = net_list.net_name(net_id);
     bool is_multicast_net = (net_name.find("bcast") != std::string::npos) && (num_sinks > 1);
@@ -416,6 +419,11 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
             return pin_criticality[a] > pin_criticality[b];
         });
     }
+#endif /* [TETRIS CUSTOM DISABLED: multicast detection + heuristic sink ordering] */
+    // Sort by criticality (original VPR behavior)
+    std::stable_sort(begin(remaining_targets), end(remaining_targets), [&](int a, int b) {
+        return pin_criticality[a] > pin_criticality[b];
+    });
 
     /* Update base costs according to fanout and criticality rules */
     update_rr_base_costs(num_sinks);
@@ -486,6 +494,7 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
         budgeting_inf.set_should_reroute(net_id, false);
     }
 
+#if 0 /* [TETRIS CUSTOM DISABLED: smart track selection + track group relaxation state] */
     // Track blacklist for multi-fanout retry mechanism
     std::unordered_map<RRNodeId, std::unordered_set<int>> blacklisted_tracks;
     // Use maximum channel width as the retry limit to allow trying all available tracks
@@ -568,6 +577,7 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
         }
     }
     // === END SMART TRACK SELECTION ===
+#endif /* [TETRIS CUSTOM DISABLED: smart track selection + track group relaxation state] */
 
     // explore in order of decreasing criticality (no longer need sink_order array)
     for (unsigned itarget = 0; itarget < remaining_targets.size(); ++itarget) {
@@ -589,6 +599,7 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
 
         profiling::conn_start();
 
+#if 0 /* [TETRIS CUSTOM DISABLED: fallback relaxation split-point check] */
         // === FALLBACK RELAXATION: Check if we've reached the pre-set split point ===
         // In fallback mode, track_group_relaxed is true but allow_new_track_group is false
         // When we reach relaxation_start_sink, enable the new track group
@@ -605,6 +616,7 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
                         size_t(opin_id), track_num, itarget - 1);
             }
         }
+#endif /* [TETRIS CUSTOM DISABLED: fallback relaxation split-point check] */
 
         // build a branch in the route tree to the target
         auto sink_flags = route_sink(router,
@@ -621,14 +633,12 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
                                      routing_predictor,
                                      choking_spots,
                                      is_flat,
-                                     net_bb,
-                                     blacklisted_tracks,
-                                     existing_opin_tracks,
-                                     allow_new_track_group);
+                                     net_bb);
 
         flags.retry_with_full_bb |= sink_flags.retry_with_full_bb;
 
         if (!sink_flags.success) {
+#if 0 /* [TETRIS CUSTOM DISABLED: multi-fanout retry with track blacklisting and track group relaxation] */
             // Multi-fanout retry mechanism: try ripping up and re-routing with the current track blacklisted
             // For multicast nets, this applies even when the first sink fails (itarget == 0)
             bool can_retry = retry_attempt < MAX_TRACK_RETRY_ATTEMPTS;
@@ -863,12 +873,16 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
             flags.success = false;
             VTR_LOG("Routing failed for sink %d of net %d\n", target_pin, size_t(net_id));
             return flags;
+#endif /* [TETRIS CUSTOM DISABLED: multi-fanout retry with track blacklisting and track group relaxation] */
+            flags.success = false;
+            return flags;
         }
 
         profiling::conn_finish(size_t(route_ctx.net_rr_terminals[net_id][0]),
                                size_t(sink_rr),
                                pin_criticality[target_pin]);
 
+#if 0 /* [TETRIS CUSTOM DISABLED: post-success tracking and track group relaxation state management] */
         // Track the highest itarget successfully routed (for relaxation decision)
         if (!track_group_relaxed && itarget + 1 > best_itarget_reached) {
             best_itarget_reached = itarget + 1;  // +1 because we've successfully routed up to and including itarget
@@ -895,10 +909,12 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
             VTR_LOG("  Disabled track group relaxation, remaining sinks will use same track\n");
         }
         // === END TRACK GROUP RELAXATION SUCCESS ===
+#endif /* [TETRIS CUSTOM DISABLED: post-success tracking and track group relaxation state management] */
 
         ++router_stats.connections_routed;
     } // finished all sinks
 
+#if 0 /* [TETRIS CUSTOM DISABLED: track group relaxation summary] */
     // === TRACK GROUP RELAXATION SUMMARY ===
     if (track_group_relaxed && is_multicast_net) {
         VTR_LOG("\n=== Track Group Relaxation Summary for '%s' ===\n", net_name.c_str());
@@ -919,6 +935,7 @@ inline NetResultFlags route_net(ConnectionRouterType& router,
         VTR_LOG("\n");
     }
     // === END TRACK GROUP RELAXATION SUMMARY ===
+#endif /* [TETRIS CUSTOM DISABLED: track group relaxation summary] */
 
     ++router_stats.nets_routed;
     profiling::net_finish();

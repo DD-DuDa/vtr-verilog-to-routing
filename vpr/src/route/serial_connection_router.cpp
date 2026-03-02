@@ -250,6 +250,24 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
     // TODO: Only disable pruning if the net has negative hold slack, maybe go off budgets
     if (!inside_bb(to_node, bounding_box)
         && !this->rcv_path_manager.is_enabled()) {
+        // Gate-aware BB exception:
+        // With transformed rr-graph, PE connections may require layer-1 CHANY "gate"
+        // nodes at in-bounding-box (x,y). Net BB layers are often [0,0], so allow these.
+        bool allow_gate_bb_exception = false;
+        if (this->rr_graph_->node_type(to_node) == e_rr_type::CHANY) {
+            int to_xlow = this->rr_graph_->node_xlow(to_node);
+            int to_ylow = this->rr_graph_->node_ylow(to_node);
+            int to_xhigh = this->rr_graph_->node_xhigh(to_node);
+            int to_yhigh = this->rr_graph_->node_yhigh(to_node);
+            bool xy_inside_bb = (to_xlow >= bounding_box.xmin
+                                 && to_ylow >= bounding_box.ymin
+                                 && to_xhigh <= bounding_box.xmax
+                                 && to_yhigh <= bounding_box.ymax);
+            int to_layer = this->rr_graph_->node_layer(to_node);
+            bool layer_oob = (to_layer < bounding_box.layer_min || to_layer > bounding_box.layer_max);
+            allow_gate_bb_exception = xy_inside_bb && layer_oob;
+        }
+        if (!allow_gate_bb_exception) {
         VTR_LOGV_DEBUG(this->router_debug_,
                        "      Pruned expansion of node %d edge %zu -> %d"
                        " (to node location %d,%d,%d x %d,%d,%d outside of expanded"
@@ -259,7 +277,8 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
                        this->rr_graph_->node_xhigh(to_node), this->rr_graph_->node_yhigh(to_node), this->rr_graph_->node_layer(to_node),
                        bounding_box.xmin, bounding_box.ymin, bounding_box.layer_min,
                        bounding_box.xmax, bounding_box.ymax, bounding_box.layer_max);
-        return; /* Node is outside (expanded) bounding box. */
+            return; /* Node is outside (expanded) bounding box. */
+        }
     }
 
     /* Prune away IPINs that lead to blocks other than the target one.  Avoids  *
