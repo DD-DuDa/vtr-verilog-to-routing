@@ -366,6 +366,51 @@ void SerialConnectionRouter<Heap>::timing_driven_expand_neighbour(const RTExplor
     }
     // === END HEURISTIC BROADCAST GEOMETRIC CONSTRAINT ===
 
+    // === MAX OPIN FANOUT TRACK CAP ===
+    // CSL currently exposes only 3 broadcast send-color slots per PE. Default
+    // VPR multicast routing may attach more than 3 distinct CHAN tracks to the
+    // same OPIN when routing different sinks of the same net. Cap the number of
+    // distinct OPIN fanout tracks at 3 by pruning any candidate that would
+    // introduce a fourth track.
+    if (this->conn_params_
+        && this->conn_params_->net_id_ != ParentNetId::INVALID()) {
+        auto ntype = [&](RRNodeId n) { return this->rr_graph_->node_type(n); };
+        auto track = [&](RRNodeId n) { return this->rr_graph_->node_track_num(n); };
+
+        if (ntype(from_node) == e_rr_type::OPIN
+            && (ntype(to_node) == e_rr_type::CHANX || ntype(to_node) == e_rr_type::CHANY)) {
+            static constexpr size_t k_max_opin_fanout_tracks = 3;
+
+            auto& route_ctx = g_vpr_ctx.routing();
+            ParentNetId net_id = this->conn_params_->net_id_;
+            if (route_ctx.route_trees[net_id]) {
+                const RouteTree& tree = route_ctx.route_trees[net_id].value();
+                auto opin_node_opt = tree.find_by_rr_id(from_node);
+                if (opin_node_opt) {
+                    std::unordered_set<int> used_tracks;
+                    for (const auto& child : opin_node_opt.value().child_nodes()) {
+                        e_rr_type child_type = ntype(child.inode);
+                        if (child_type == e_rr_type::CHANX || child_type == e_rr_type::CHANY) {
+                            used_tracks.insert(track(child.inode));
+                        }
+                    }
+
+                    int cand_track = track(to_node);
+                    bool is_new_track = (used_tracks.find(cand_track) == used_tracks.end());
+                    if (is_new_track && used_tracks.size() >= k_max_opin_fanout_tracks) {
+                        VTR_LOGV_DEBUG(this->router_debug_,
+                                       "      Pruned expansion: OPIN %d already uses %zu tracks, "
+                                       "rejecting new track %d (cap=%zu)\n",
+                                       size_t(from_node), used_tracks.size(), cand_track,
+                                       k_max_opin_fanout_tracks);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    // === END MAX OPIN FANOUT TRACK CAP ===
+
     // === CUSTOM ILLEGAL-PATTERN PRUNING (enable when needed) ===
     // Set this to true to activate the constraints
     // printf("Using serial_connection_router.cpp\n"); // we use this for routing

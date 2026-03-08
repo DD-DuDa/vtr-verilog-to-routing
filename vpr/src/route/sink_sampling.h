@@ -123,9 +123,12 @@ inline Side which_side(RRNodeId inode, Axis cutline_axis, int cutline_pos) {
     if (cutline_axis == Axis::X) {
         int x = rr_graph.node_xlow(inode);
         return Side(x > cutline_pos); /* 1 is RIGHT */
-    } else {
+    } else if (cutline_axis == Axis::Y) {
         int y = rr_graph.node_ylow(inode);
         return Side(y > cutline_pos);
+    } else {
+        int layer = rr_graph.node_layer(inode);
+        return Side(layer > cutline_pos);
     }
 }
 

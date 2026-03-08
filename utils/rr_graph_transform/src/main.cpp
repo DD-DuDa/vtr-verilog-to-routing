@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -59,6 +60,68 @@ struct RemovedEdgeInfo {
     int switch_id = -1;
 };
 
+constexpr int kTypeOther = 0;
+constexpr int kTypeChanx = 1;
+constexpr int kTypeChany = 2;
+constexpr int kTypeOpin = 3;
+constexpr int kTypeIpin = 4;
+
+int node_type_code(const std::string& type) {
+    if (type == "CHANX") return kTypeChanx;
+    if (type == "CHANY") return kTypeChany;
+    if (type == "OPIN") return kTypeOpin;
+    if (type == "IPIN") return kTypeIpin;
+    return kTypeOther;
+}
+
+struct NodeLookupKey {
+    int type_code = 0;
+    int layer = 0;
+    int x = 0;
+    int y = 0;
+    int ptc = -1;
+
+    bool operator==(const NodeLookupKey& other) const {
+        return type_code == other.type_code
+               && layer == other.layer
+               && x == other.x
+               && y == other.y
+               && ptc == other.ptc;
+    }
+};
+
+struct NodeLookupKeyHash {
+    std::size_t operator()(const NodeLookupKey& k) const noexcept {
+        std::size_t h = static_cast<std::size_t>(k.type_code);
+        h ^= static_cast<std::size_t>(k.layer) * 0x9e3779b1u + (h << 6) + (h >> 2);
+        h ^= static_cast<std::size_t>(k.x) * 0x85ebca6bu + (h << 6) + (h >> 2);
+        h ^= static_cast<std::size_t>(k.y) * 0xc2b2ae35u + (h << 6) + (h >> 2);
+        h ^= static_cast<std::size_t>(k.ptc) * 0x27d4eb2fu + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct EdgeKey {
+    int src = -1;
+    int sink = -1;
+    int switch_id = -1;
+
+    bool operator==(const EdgeKey& other) const {
+        return src == other.src
+               && sink == other.sink
+               && switch_id == other.switch_id;
+    }
+};
+
+struct EdgeKeyHash {
+    std::size_t operator()(const EdgeKey& k) const noexcept {
+        std::size_t h = static_cast<std::size_t>(k.src);
+        h ^= static_cast<std::size_t>(k.sink) * 0x9e3779b1u + (h << 6) + (h >> 2);
+        h ^= static_cast<std::size_t>(k.switch_id) * 0x85ebca6bu + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
 struct ParsedGraph {
     pugi::xml_document doc;
     pugi::xml_node rr_graph;
@@ -68,7 +131,7 @@ struct ParsedGraph {
     pugi::xml_node block_types;
 
     std::unordered_map<int, NodeInfo> nodes_by_id;
-    std::unordered_map<std::string, int> node_key_to_id;
+    std::unordered_map<NodeLookupKey, int, NodeLookupKeyHash> node_key_to_id;
     std::unordered_set<long long> pe_tiles_xy;
 
     std::vector<EdgeInfo> edges;
@@ -96,14 +159,9 @@ void set_int_attr(pugi::xml_node node, const char* name, int value) {
     attr.set_value(value);
 }
 
-std::string node_key(const std::string& type, int layer, int x, int y, int ptc) {
-    std::ostringstream oss;
-    oss << type << "|" << layer << "|" << x << "|" << y << "|" << ptc;
-    return oss.str();
-}
-
 int find_node_id(const ParsedGraph& g, const std::string& type, int layer, int x, int y, int ptc) {
-    const auto it = g.node_key_to_id.find(node_key(type, layer, x, y, ptc));
+    const NodeLookupKey key{node_type_code(type), layer, x, y, ptc};
+    const auto it = g.node_key_to_id.find(key);
     if (it == g.node_key_to_id.end()) return -1;
     return it->second;
 }
@@ -141,6 +199,17 @@ bool parse_graph(const char* input_file, ParsedGraph& g) {
     if (!g.rr_edges) {
         std::cerr << "Error: No rr_edges section found\n";
         return false;
+    }
+
+    const int declared_node_count = to_int(g.rr_nodes.attribute("count"), 0);
+    if (declared_node_count > 0) {
+        g.nodes_by_id.reserve(static_cast<std::size_t>(declared_node_count));
+        g.node_key_to_id.reserve(static_cast<std::size_t>(declared_node_count));
+    }
+
+    const int declared_edge_count = to_int(g.rr_edges.attribute("count"), 0);
+    if (declared_edge_count > 0) {
+        g.edges.reserve(static_cast<std::size_t>(declared_edge_count));
     }
 
     // Find pe_tile block type id.
@@ -194,7 +263,8 @@ bool parse_graph(const char* input_file, ParsedGraph& g) {
 
         g.nodes_by_id[n.id] = n;
         if (is_unit_node(n) && n.ptc >= 0) {
-            g.node_key_to_id[node_key(n.type, n.layer, n.xlow, n.ylow, n.ptc)] = n.id;
+            const NodeLookupKey key{node_type_code(n.type), n.layer, n.xlow, n.ylow, n.ptc};
+            g.node_key_to_id[key] = n.id;
         }
         if (!g.chany_template && n.type == "CHANY") {
             g.chany_template = node;
@@ -352,7 +422,7 @@ int fixed_gate_y_for_pe_track(int pe_y) {
 }
 
 int get_or_create_gate_chany_node(ParsedGraph& g, int x, int y, int track, int gate_layer, const NodeInfo* template_src) {
-    const std::string key = node_key("CHANY", gate_layer, x, y, track);
+    const NodeLookupKey key{kTypeChany, gate_layer, x, y, track};
     auto it = g.node_key_to_id.find(key);
     if (it != g.node_key_to_id.end()) {
         return it->second;
@@ -410,17 +480,11 @@ int get_or_create_gate_chany_node(ParsedGraph& g, int x, int y, int track, int g
     return new_id;
 }
 
-std::string edge_key(int src, int sink, int sw) {
-    std::ostringstream oss;
-    oss << src << "|" << sink << "|" << sw;
-    return oss.str();
-}
-
 void push_edge_unique(std::vector<EdgeInfo>& out_edges,
-                      std::unordered_set<std::string>& edge_seen,
+                      std::unordered_set<EdgeKey, EdgeKeyHash>& edge_seen,
                       int src, int sink, int sw) {
     if (src < 0 || sink < 0 || sw < 0) return;
-    const std::string key = edge_key(src, sink, sw);
+    const EdgeKey key{src, sink, sw};
     if (edge_seen.insert(key).second) {
         out_edges.push_back({src, sink, sw});
     }
@@ -805,9 +869,43 @@ bool transform_cerebras(ParsedGraph& g, int gate_layer) {
     // Final deduplication.
     std::vector<EdgeInfo> dedup_edges;
     dedup_edges.reserve(cleaned_edges.size());
-    std::unordered_set<std::string> seen;
+    std::unordered_set<EdgeKey, EdgeKeyHash> seen;
+    seen.reserve(cleaned_edges.size() * 2 + 1);
     for (const auto& e : cleaned_edges) {
         push_edge_unique(dedup_edges, seen, e.src, e.sink, e.switch_id);
+    }
+
+    // Boundary cleanup: remove edges touching CHANY(x=0) on any layer, or layer-0 CHANX(y=0).
+    // Mirrors the original boundary mode to prevent routing along the left/bottom edge.
+    // This includes gate nodes at x=0 (CHANY(x=0, layer=gate_layer)) — they are removed too.
+    std::vector<EdgeInfo> boundary_cleaned;
+    boundary_cleaned.reserve(dedup_edges.size());
+    size_t removed_boundary = 0;
+    for (const auto& e : dedup_edges) {
+        auto src_it = g.nodes_by_id.find(e.src);
+        auto sink_it = g.nodes_by_id.find(e.sink);
+        if (src_it == g.nodes_by_id.end() || sink_it == g.nodes_by_id.end()) {
+            boundary_cleaned.push_back(e);
+            continue;
+        }
+        const NodeInfo& src = src_it->second;
+        const NodeInfo& sink = sink_it->second;
+
+        bool is_boundary = false;
+        if (src.type == "CHANY" && src.xlow == 0 && src.xhigh == 0)
+            is_boundary = true;
+        if (!is_boundary && sink.type == "CHANY" && sink.xlow == 0 && sink.xhigh == 0)
+            is_boundary = true;
+        if (!is_boundary && src.type == "CHANX" && src.layer == 0 && src.ylow == 0 && src.yhigh == 0)
+            is_boundary = true;
+        if (!is_boundary && sink.type == "CHANX" && sink.layer == 0 && sink.ylow == 0 && sink.yhigh == 0)
+            is_boundary = true;
+
+        if (is_boundary) {
+            removed_boundary++;
+        } else {
+            boundary_cleaned.push_back(e);
+        }
     }
 
     std::cout << "cerebras mode summary:\n"
@@ -826,10 +924,11 @@ bool transform_cerebras(ParsedGraph& g, int gate_layer) {
               << "  removed by strict base exact policy (R8): " << removed_r8_base_exact << "\n"
               << "  removed by strict pin policy (R8): " << removed_r8_pin_exact << "\n"
               << "  removed in global cleanup (R8): " << removed_r8 << "\n"
+              << "  removed boundary CHAN edges (x=0 CHANY any-layer / y=0 CHANX layer-0): " << removed_boundary << "\n"
               << "  gate nodes tracked: " << gate_node_ids.size() << "\n"
-              << "  edges out: " << dedup_edges.size() << "\n";
+              << "  edges out: " << boundary_cleaned.size() << "\n";
 
-    return write_edges(g, dedup_edges);
+    return write_edges(g, boundary_cleaned);
 }
 
 TransformMode parse_mode(const std::string& mode_str) {

@@ -1,5 +1,6 @@
 #include "partition_tree.h"
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <stack>
 #include <unordered_set>
@@ -10,30 +11,53 @@
  * and the task creation overhead outweighs the advantage of partitioning, so we should stop. */
 constexpr size_t MIN_NETS_TO_PARTITION = 256;
 
+static bool layer_aware_partition_enabled() {
+    static const bool enabled = []() {
+        const char* raw = std::getenv("VPR_PARALLEL_LAYER_AWARE_PARTITION");
+        return raw != nullptr && std::atoi(raw) > 0;
+    }();
+    return enabled;
+}
+
 PartitionTree::PartitionTree(const Netlist<>& netlist) {
     const auto& device_ctx = g_vpr_ctx.device();
 
     auto all_nets = std::unordered_set<ParentNetId>(netlist.nets().begin(), netlist.nets().end());
-    _root = build_helper(netlist, all_nets, 0, 0, device_ctx.grid.width() - 1, device_ctx.grid.height() - 1);
+    _root = build_helper(netlist,
+                         all_nets,
+                         0,
+                         0,
+                         device_ctx.grid.width() - 1,
+                         device_ctx.grid.height() - 1,
+                         0,
+                         device_ctx.grid.get_num_layers() - 1);
 }
 
 /** Build a branch of the PartitionTree given a set of \p nets and a bounding box.
  * Calls itself recursively with smaller and smaller bounding boxes until there are less
  * nets than \ref MIN_NETS_TO_PARTITION. */
-std::unique_ptr<PartitionTreeNode> PartitionTree::build_helper(const Netlist<>& netlist, const std::unordered_set<ParentNetId>& nets, int x1, int y1, int x2, int y2) {
+std::unique_ptr<PartitionTreeNode> PartitionTree::build_helper(const Netlist<>& netlist,
+                                                               const std::unordered_set<ParentNetId>& nets,
+                                                               int x1,
+                                                               int y1,
+                                                               int x2,
+                                                               int y2,
+                                                               int l1,
+                                                               int l2) {
     if (nets.empty())
         return nullptr;
 
     const auto& route_ctx = g_vpr_ctx.routing();
 
-    /* Only build this for 2 dimensions. Ignore the layers for now */
-    const auto& device_ctx = g_vpr_ctx.device();
-    int layer_max = device_ctx.grid.get_num_layers() - 1;
-
     auto out = std::make_unique<PartitionTreeNode>();
+    const bool layer_aware_partition = layer_aware_partition_enabled();
+    int width = x2 - x1 + 1;
+    int height = y2 - y1 + 1;
+    int num_layers = l2 - l1 + 1;
+    int partition_layers = layer_aware_partition ? num_layers : 1;
 
-    if (nets.size() < MIN_NETS_TO_PARTITION) {
-        out->bb = {x1, x2, y1, y2, 0, layer_max};
+    if (nets.size() < MIN_NETS_TO_PARTITION || (width <= 1 && height <= 1 && partition_layers <= 1)) {
+        out->bb = {x1, x2, y1, y2, l1, l2};
         out->nets = nets;
         /* Build net to ptree node lookup */
         for (auto net_id : nets) {
@@ -48,10 +72,6 @@ std::unique_ptr<PartitionTreeNode> PartitionTree::build_helper(const Netlist<>& 
      *
      * VPR's bounding boxes include the borders (see SerialConnectionRouter::timing_driven_expand_neighbour())
      * so try to include x=bb.xmax, y=bb.ymax etc. when calculating things. */
-    int width = x2 - x1 + 1;
-    int height = y2 - y1 + 1;
-
-    VTR_ASSERT(width > 1 && height > 1);
     /* Cutlines are placed between integral coordinates.
      * For instance, x_total_before[0] assumes a cutline at x=0.5, so fanouts at x=0 are included but not
      * x=1. It's similar for x_total_after[0], which excludes fanouts at x=0 and includes x=1.
@@ -59,38 +79,56 @@ std::unique_ptr<PartitionTreeNode> PartitionTree::build_helper(const Netlist<>& 
      *
      * Here, *_total_before holds total score of nets before the cutline and not intersecting it.
      * In ParaDRo this would be total_before + total_on. (same for total_after)*/
-    std::vector<int> x_total_before(width - 1, 0), x_total_after(width - 1, 0), x_total_on(width - 1, 0);
-    std::vector<int> y_total_before(height - 1, 0), y_total_after(height - 1, 0), y_total_on(height - 1, 0);
+    std::vector<int> x_total_before(std::max(0, width - 1), 0), x_total_after(std::max(0, width - 1), 0), x_total_on(std::max(0, width - 1), 0);
+    std::vector<int> y_total_before(std::max(0, height - 1), 0), y_total_after(std::max(0, height - 1), 0), y_total_on(std::max(0, height - 1), 0);
+    std::vector<int> l_total_before(std::max(0, partition_layers - 1), 0), l_total_after(std::max(0, partition_layers - 1), 0), l_total_on(std::max(0, partition_layers - 1), 0);
 
     for (auto net_id : nets) {
         t_bb bb = route_ctx.route_bb[net_id];
         size_t fanouts = netlist.net_sinks(net_id).size();
 
-        /* Inclusive start and end coords of the bbox relative to x1. Clamp to [x1, x2]. */
-        int x_start = std::max(x1, bb.xmin) - x1;
-        int x_end = std::min(bb.xmax, x2) - x1;
-        /* Fill in the lookups assuming a cutline at x + 0.5.
-         * This means total_before includes the max coord of the bbox but
-         * total_after does not include the min coord. */
-        for (int x = x_end; x < width - 1; x++) {
-            x_total_before[x] += fanouts;
+        if (width > 1) {
+            /* Inclusive start and end coords of the bbox relative to x1. Clamp to [x1, x2]. */
+            int x_start = std::max(x1, bb.xmin) - x1;
+            int x_end = std::min(bb.xmax, x2) - x1;
+            /* Fill in the lookups assuming a cutline at x + 0.5.
+             * This means total_before includes the max coord of the bbox but
+             * total_after does not include the min coord. */
+            for (int x = x_end; x < width - 1; x++) {
+                x_total_before[x] += fanouts;
+            }
+            for (int x = 0; x < x_start; x++) {
+                x_total_after[x] += fanouts;
+            }
+            for (int x = x_start; x < x_end; x++) {
+                x_total_on[x] += fanouts;
+            }
         }
-        for (int x = 0; x < x_start; x++) {
-            x_total_after[x] += fanouts;
+        if (height > 1) {
+            int y_start = std::max(y1, bb.ymin) - y1;
+            int y_end = std::min(bb.ymax, y2) - y1;
+            for (int y = y_end; y < height - 1; y++) {
+                y_total_before[y] += fanouts;
+            }
+            for (int y = 0; y < y_start; y++) {
+                y_total_after[y] += fanouts;
+            }
+            for (int y = y_start; y < y_end; y++) {
+                y_total_on[y] += fanouts;
+            }
         }
-        for (int x = x_start; x < x_end; x++) {
-            x_total_on[x] += fanouts;
-        }
-        int y_start = std::max(y1, bb.ymin) - y1;
-        int y_end = std::min(bb.ymax, y2) - y1;
-        for (int y = y_end; y < height - 1; y++) {
-            y_total_before[y] += fanouts;
-        }
-        for (int y = 0; y < y_start; y++) {
-            y_total_after[y] += fanouts;
-        }
-        for (int y = y_start; y < y_end; y++) {
-            y_total_on[y] += fanouts;
+        if (partition_layers > 1) {
+            int l_start = std::max(l1, bb.layer_min) - l1;
+            int l_end = std::min(l2, bb.layer_max) - l1;
+            for (int l = l_end; l < partition_layers - 1; l++) {
+                l_total_before[l] += fanouts;
+            }
+            for (int l = 0; l < l_start; l++) {
+                l_total_after[l] += fanouts;
+            }
+            for (int l = l_start; l < l_end; l++) {
+                l_total_on[l] += fanouts;
+            }
         }
     }
 
@@ -98,43 +136,62 @@ std::unique_ptr<PartitionTreeNode> PartitionTree::build_helper(const Netlist<>& 
     float best_pos = std::numeric_limits<double>::quiet_NaN();
     Axis best_axis = Axis::X;
 
-    for (int x = 0; x < width - 1; x++) {
-        int before = x_total_before[x];
-        int after = x_total_after[x];
-        if (before == 0 || after == 0) /* Cutting here would leave no nets to the left or right */
-            continue;
-        /* Now get a measure of "critical path": work on cutline + max(work on sides) */
-        int score = x_total_on[x] + std::max(x_total_before[x], x_total_after[x]);
-        // int score = std::abs(int(x_total_before[x]) - int(x_total_after[x]));
-        if (score < best_score) {
-            best_score = score;
-            best_pos = x1 + x + 0.5; /* Lookups are relative to (x1, y1) */
-            best_axis = Axis::X;
+    if (width > 1) {
+        for (int x = 0; x < width - 1; x++) {
+            int before = x_total_before[x];
+            int after = x_total_after[x];
+            if (before == 0 || after == 0) /* Cutting here would leave no nets to the left or right */
+                continue;
+            /* Now get a measure of "critical path": work on cutline + max(work on sides) */
+            int score = x_total_on[x] + std::max(x_total_before[x], x_total_after[x]);
+            if (score < best_score) {
+                best_score = score;
+                best_pos = x1 + x + 0.5; /* Lookups are relative to (x1, y1) */
+                best_axis = Axis::X;
+            }
         }
     }
 
-    for (int y = 0; y < height - 1; y++) {
-        int before = y_total_before[y];
-        int after = y_total_after[y];
-        if (before == 0 || after == 0) /* Cutting here would leave no nets to the left or right (sideways) */
-            continue;
-        int score = y_total_on[y] + std::max(y_total_before[y], y_total_after[y]);
-        // int score = std::abs(int(y_total_before[y]) - int(y_total_after[y]));
-        if (score < best_score) {
-            best_score = score;
-            best_pos = y1 + y + 0.5; /* Lookups are relative to (x1, y1) */
-            best_axis = Axis::Y;
+    if (height > 1) {
+        for (int y = 0; y < height - 1; y++) {
+            int before = y_total_before[y];
+            int after = y_total_after[y];
+            if (before == 0 || after == 0) /* Cutting here would leave no nets to the left or right (sideways) */
+                continue;
+            int score = y_total_on[y] + std::max(y_total_before[y], y_total_after[y]);
+            if (score < best_score) {
+                best_score = score;
+                best_pos = y1 + y + 0.5; /* Lookups are relative to (x1, y1) */
+                best_axis = Axis::Y;
+            }
+        }
+    }
+
+    if (partition_layers > 1) {
+        for (int l = 0; l < partition_layers - 1; l++) {
+            int before = l_total_before[l];
+            int after = l_total_after[l];
+            if (before == 0 || after == 0) {
+                continue;
+            }
+            int score = l_total_on[l] + std::max(l_total_before[l], l_total_after[l]);
+            if (score < best_score) {
+                best_score = score;
+                best_pos = l1 + l + 0.5;
+                best_axis = Axis::LAYER;
+            }
         }
     }
 
     /* Couldn't find a cutline: all cutlines result in a one-way cut */
     if (std::isnan(best_pos)) {
-        out->bb = {x1, x2, y1, y2, 0, layer_max};
+        out->bb = {x1, x2, y1, y2, l1, l2};
         out->nets = nets;
         /* Build net to ptree node lookup */
         for (auto net_id : nets) {
             _net_to_ptree_node[net_id] = out.get();
         }
+        return out;
     }
 
     /* Populate net IDs on each side and call next level of build_x */
@@ -152,10 +209,9 @@ std::unique_ptr<PartitionTreeNode> PartitionTree::build_helper(const Netlist<>& 
             }
         }
 
-        out->left = build_helper(netlist, left_nets, x1, y1, std::floor(best_pos), y2);
-        out->right = build_helper(netlist, right_nets, std::floor(best_pos + 1), y1, x2, y2);
-    } else {
-        VTR_ASSERT(best_axis == Axis::Y);
+        out->left = build_helper(netlist, left_nets, x1, y1, std::floor(best_pos), y2, l1, l2);
+        out->right = build_helper(netlist, right_nets, std::floor(best_pos + 1), y1, x2, y2, l1, l2);
+    } else if (best_axis == Axis::Y) {
         for (auto net_id : nets) {
             t_bb bb = route_ctx.route_bb[net_id];
             if (bb.ymax < best_pos) {
@@ -167,8 +223,22 @@ std::unique_ptr<PartitionTreeNode> PartitionTree::build_helper(const Netlist<>& 
             }
         }
 
-        out->left = build_helper(netlist, left_nets, x1, y1, x2, std::floor(best_pos));
-        out->right = build_helper(netlist, right_nets, x1, std::floor(best_pos + 1), x2, y2);
+        out->left = build_helper(netlist, left_nets, x1, y1, x2, std::floor(best_pos), l1, l2);
+        out->right = build_helper(netlist, right_nets, x1, std::floor(best_pos + 1), x2, y2, l1, l2);
+    } else {
+        VTR_ASSERT(best_axis == Axis::LAYER);
+        for (auto net_id : nets) {
+            t_bb bb = route_ctx.route_bb[net_id];
+            if (bb.layer_max < best_pos) {
+                left_nets.insert(net_id);
+            } else if (bb.layer_min > best_pos) {
+                right_nets.insert(net_id);
+            } else {
+                my_nets.insert(net_id);
+            }
+        }
+        out->left = build_helper(netlist, left_nets, x1, y1, x2, y2, l1, std::floor(best_pos));
+        out->right = build_helper(netlist, right_nets, x1, y1, x2, y2, std::floor(best_pos + 1), l2);
     }
 
     if (out->left)
@@ -176,7 +246,7 @@ std::unique_ptr<PartitionTreeNode> PartitionTree::build_helper(const Netlist<>& 
     if (out->right)
         out->right->parent = out.get();
 
-    out->bb = {x1, x2, y1, y2, 0, 0};
+    out->bb = {x1, x2, y1, y2, l1, l2};
     out->nets = my_nets;
     out->cutline_axis = best_axis;
     out->cutline_pos = best_pos;
@@ -191,7 +261,12 @@ std::unique_ptr<PartitionTreeNode> PartitionTree::build_helper(const Netlist<>& 
 inline bool net_in_ptree_node(ParentNetId net_id, const PartitionTreeNode* node) {
     auto& route_ctx = g_vpr_ctx.routing();
     const t_bb& bb = route_ctx.route_bb[net_id];
-    return bb.xmin >= node->bb.xmin && bb.xmax <= node->bb.xmax && bb.ymin >= node->bb.ymin && bb.ymax <= node->bb.ymax;
+    return bb.xmin >= node->bb.xmin
+           && bb.xmax <= node->bb.xmax
+           && bb.ymin >= node->bb.ymin
+           && bb.ymax <= node->bb.ymax
+           && bb.layer_min >= node->bb.layer_min
+           && bb.layer_max <= node->bb.layer_max;
 }
 
 void PartitionTree::update_nets(const std::vector<ParentNetId>& nets) {

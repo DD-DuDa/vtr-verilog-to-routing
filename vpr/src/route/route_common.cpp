@@ -12,6 +12,14 @@
 #include "vpr_utils.h"
 #include "route_utilization.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
 #if defined(VPR_USE_TBB)
 #include <tbb/parallel_for_each.h>
 #include <tbb/combinable.h>
@@ -90,6 +98,68 @@ static float comp_initial_acc_cost(RRNodeId node_id,
                                    const t_router_opts& route_opts,
                                    const vtr::NdMatrix<double, 3>& chanx_util,
                                    const vtr::NdMatrix<double, 3>& chany_util);
+
+struct t_floorplan_region {
+    int xmin;
+    int xmax;
+    int ymin;
+    int ymax;
+};
+
+static const std::vector<t_floorplan_region>& get_floorplan_regions_from_env() {
+    static const std::vector<t_floorplan_region> regions = []() {
+        std::vector<t_floorplan_region> parsed;
+        const char* raw_regions = std::getenv("VPR_FLOORPLAN_REGIONS");
+        if (!raw_regions || raw_regions[0] == '\0') {
+            return parsed;
+        }
+
+        std::stringstream region_stream(raw_regions);
+        std::string region_token;
+        while (std::getline(region_stream, region_token, ';')) {
+            if (region_token.empty()) {
+                continue;
+            }
+
+            std::stringstream value_stream(region_token);
+            std::string value_token;
+            std::vector<int> vals;
+            while (std::getline(value_stream, value_token, ':')) {
+                if (value_token.empty()) {
+                    continue;
+                }
+                vals.push_back(std::atoi(value_token.c_str()));
+            }
+            if (vals.size() != 4) {
+                continue;
+            }
+
+            t_floorplan_region region{
+                vals[0],
+                vals[1],
+                vals[2],
+                vals[3],
+            };
+            if (region.xmin > region.xmax || region.ymin > region.ymax) {
+                continue;
+            }
+            parsed.push_back(region);
+        }
+        return parsed;
+    }();
+    return regions;
+}
+
+static int find_floorplan_region_for_point(const std::vector<t_floorplan_region>& regions, int x, int y) {
+    for (size_t i = 0; i < regions.size(); ++i) {
+        const auto& region = regions[i];
+        if (x >= region.xmin && x <= region.xmax
+            && y >= region.ymin && y <= region.ymax) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
 
 /************************** Subroutine definitions ***************************/
 
@@ -779,6 +849,13 @@ t_bb load_net_route_bb(const Netlist<>& net_list,
     int ymax = rr_graph.node_yhigh(driver_rr);
     int layer_min = rr_graph.node_layer(driver_rr);
     int layer_max = rr_graph.node_layer(driver_rr);
+    std::vector<std::pair<int, int>> terminal_points;
+    {
+        vtr::Rect<int> driver_tile_bb = device_ctx.grid.get_tile_bb({rr_graph.node_xlow(driver_rr),
+                                                                      rr_graph.node_ylow(driver_rr),
+                                                                      rr_graph.node_layer(driver_rr)});
+        terminal_points.emplace_back(driver_tile_bb.xmin(), driver_tile_bb.ymin());
+    }
 
     auto net_sinks = net_list.net_sinks(net_id);
     for (size_t ipin = 1; ipin < net_sinks.size() + 1; ++ipin) { //Start at 1 since looping through sinks
@@ -801,6 +878,7 @@ t_bb load_net_route_bb(const Netlist<>& net_list,
         ymax = std::max<int>(ymax, tile_bb.ymax());
         layer_min = std::min<int>(layer_min, rr_graph.node_layer(sink_rr));
         layer_max = std::max<int>(layer_max, rr_graph.node_layer(sink_rr));
+        terminal_points.emplace_back(tile_bb.xmin(), tile_bb.ymin());
     }
 
     // Want the channels on all 4 sides to be usable, even if bb_factor = 0.
@@ -817,6 +895,63 @@ t_bb load_net_route_bb(const Netlist<>& net_list,
     bb.ymax = std::min<int>(ymax + bb_factor, device_ctx.grid.height() - 1);
     bb.layer_min = layer_min;
     bb.layer_max = layer_max;
+
+    const auto& floorplan_regions = get_floorplan_regions_from_env();
+    if (!floorplan_regions.empty()) {
+        std::unordered_set<int> touched_regions;
+        bool all_terminals_mapped = true;
+        for (const auto& point : terminal_points) {
+            int region_idx = find_floorplan_region_for_point(floorplan_regions, point.first, point.second);
+            if (region_idx < 0) {
+                all_terminals_mapped = false;
+                break;
+            }
+            touched_regions.insert(region_idx);
+        }
+
+        if (all_terminals_mapped && !touched_regions.empty() && touched_regions.size() <= 2) {
+            int clamp_xmin = std::numeric_limits<int>::max();
+            int clamp_xmax = std::numeric_limits<int>::min();
+            int clamp_ymin = std::numeric_limits<int>::max();
+            int clamp_ymax = std::numeric_limits<int>::min();
+
+            for (int region_idx : touched_regions) {
+                const auto& region = floorplan_regions[region_idx];
+                clamp_xmin = std::min(clamp_xmin, region.xmin);
+                clamp_xmax = std::max(clamp_xmax, region.xmax);
+                clamp_ymin = std::min(clamp_ymin, region.ymin);
+                clamp_ymax = std::max(clamp_ymax, region.ymax);
+            }
+
+            int floorplan_margin = 2;
+            const char* raw_margin = std::getenv("VPR_FLOORPLAN_BB_MARGIN");
+            if (raw_margin) {
+                floorplan_margin = std::max(0, std::atoi(raw_margin));
+            }
+
+            clamp_xmin = std::max(0, clamp_xmin - floorplan_margin);
+            clamp_xmax = std::min<int>(device_ctx.grid.width() - 1, clamp_xmax + floorplan_margin);
+            clamp_ymin = std::max(0, clamp_ymin - floorplan_margin);
+            clamp_ymax = std::min<int>(device_ctx.grid.height() - 1, clamp_ymax + floorplan_margin);
+
+            int orig_xmin = bb.xmin;
+            int orig_xmax = bb.xmax;
+            int orig_ymin = bb.ymin;
+            int orig_ymax = bb.ymax;
+
+            bb.xmin = std::max(bb.xmin, clamp_xmin);
+            bb.xmax = std::min(bb.xmax, clamp_xmax);
+            bb.ymin = std::max(bb.ymin, clamp_ymin);
+            bb.ymax = std::min(bb.ymax, clamp_ymax);
+
+            if (bb.xmin > bb.xmax || bb.ymin > bb.ymax) {
+                bb.xmin = orig_xmin;
+                bb.xmax = orig_xmax;
+                bb.ymin = orig_ymin;
+                bb.ymax = orig_ymax;
+            }
+        }
+    }
 
     return bb;
 }

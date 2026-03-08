@@ -12,7 +12,8 @@
 
 /** Self-descriptive */
 enum class Axis { X,
-                  Y };
+                  Y,
+                  LAYER };
 
 /** Which side of a line? */
 enum class Side { LEFT = 0,
@@ -96,7 +97,7 @@ class PartitionTree {
   private:
     std::unique_ptr<PartitionTreeNode> _root;
     std::unordered_map<ParentNetId, PartitionTreeNode*> _net_to_ptree_node;
-    std::unique_ptr<PartitionTreeNode> build_helper(const Netlist<>& netlist, const std::unordered_set<ParentNetId>& nets, int x1, int y1, int x2, int y2);
+    std::unique_ptr<PartitionTreeNode> build_helper(const Netlist<>& netlist, const std::unordered_set<ParentNetId>& nets, int x1, int y1, int x2, int y2, int l1, int l2);
 };
 
 #ifdef VPR_DEBUG_PARTITION_TREE

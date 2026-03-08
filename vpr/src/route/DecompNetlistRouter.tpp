@@ -124,8 +124,11 @@ inline bool should_decompose_vnet(const VirtualNet& vnet, const PartitionTreeNod
     if (node.cutline_axis == Axis::X) {
         if (vnet.clipped_bb.xmin > node.cutline_pos || vnet.clipped_bb.xmax < node.cutline_pos)
             return false;
-    } else {
+    } else if (node.cutline_axis == Axis::Y) {
         if (vnet.clipped_bb.ymin > node.cutline_pos || vnet.clipped_bb.ymax < node.cutline_pos)
+            return false;
+    } else {
+        if (vnet.clipped_bb.layer_min > node.cutline_pos || vnet.clipped_bb.layer_max < node.cutline_pos)
             return false;
     }
 
@@ -286,6 +289,10 @@ inline t_bb clip_to_side(const t_bb& bb, Axis axis, int cutline_pos, Side side) 
         out.ymax = cutline_pos;
     else if (axis == Axis::Y && side == Side::RIGHT)
         out.ymin = cutline_pos + 1;
+    else if (axis == Axis::LAYER && side == Side::LEFT)
+        out.layer_max = cutline_pos;
+    else if (axis == Axis::LAYER && side == Side::RIGHT)
+        out.layer_min = cutline_pos + 1;
     else
         VTR_ASSERT_MSG(false, "Unreachable");
     return out;
@@ -455,8 +462,11 @@ inline bool is_close_to_cutline(RRNodeId inode, Axis cutline_axis, int cutline_p
     /* Cutlines are considered to be at x + 0.5, set a thickness of +1 here by checking for equality */
     if (cutline_axis == Axis::X) {
         return tile_bb.xmin() - thickness <= cutline_pos && tile_bb.xmax() + thickness >= cutline_pos;
-    } else {
+    } else if (cutline_axis == Axis::Y) {
         return tile_bb.ymin() - thickness <= cutline_pos && tile_bb.ymax() + thickness >= cutline_pos;
+    } else {
+        int layer = rr_graph.node_layer(inode);
+        return std::abs(layer - cutline_pos) <= thickness;
     }
 }
 
@@ -485,6 +495,10 @@ inline bool is_close_to_bb(RRNodeId inode, const t_bb& bb, int thickness) {
  * * have less than MIN_SINKS sinks in the sink side?
  * If so, put all sinks in the sink side into \p out and return true */
 inline bool get_reduction_mask(ParentNetId net_id, Axis cutline_axis, int cutline_pos, vtr::dynamic_bitset<>& out) {
+    if (cutline_axis == Axis::LAYER) {
+        return false;
+    }
+
     const auto& route_ctx = g_vpr_ctx.routing();
 
     const RouteTree& tree = route_ctx.route_trees[net_id].value();
@@ -573,6 +587,10 @@ vtr::dynamic_bitset<> DecompNetlistRouter<HeapType>::get_decomposition_mask(Pare
  * * have less than MIN_SINKS sinks in at least one side?
  * If so, put all sinks in the sides matching the above condition into \p out and return true */
 inline int get_reduction_mask_vnet_no_source(const VirtualNet& vnet, Axis cutline_axis, int cutline_pos, vtr::dynamic_bitset<>& out) {
+    if (cutline_axis == Axis::LAYER) {
+        return 0;
+    }
+
     const auto& route_ctx = g_vpr_ctx.routing();
 
     const RouteTree& tree = route_ctx.route_trees[vnet.net_id].value();
@@ -628,6 +646,10 @@ inline int get_reduction_mask_vnet_no_source(const VirtualNet& vnet, Axis cutlin
 /** Similar fn to \see get_reduction_mask, but works with virtual nets
  * and checks against the clipped bounding box instead of the cutline when counting sink-side sinks. */
 inline bool get_reduction_mask_vnet_with_source(const VirtualNet& vnet, Axis cutline_axis, int cutline_pos, vtr::dynamic_bitset<>& out) {
+    if (cutline_axis == Axis::LAYER) {
+        return false;
+    }
+
     const auto& route_ctx = g_vpr_ctx.routing();
 
     const RouteTree& tree = route_ctx.route_trees[vnet.net_id].value();
