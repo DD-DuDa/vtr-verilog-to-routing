@@ -13,6 +13,10 @@
 #include "router_lookahead_report.h"
 #include "vtr_time.h"
 
+#include <cstdlib>
+#include <sstream>
+#include <unordered_set>
+
 bool route(const Netlist<>& net_list,
            int width_fac,
            const t_router_opts& router_opts,
@@ -82,6 +86,27 @@ bool route(const Netlist<>& net_list,
                        router_opts.bb_factor,
                        router_opts.has_choke_point,
                        is_flat);
+
+    // Parse VPR_FIXED_NETS env var for two-phase routing
+    std::unordered_set<size_t> fixed_net_ids;
+    const char* fixed_nets_env = std::getenv("VPR_FIXED_NETS");
+    if (fixed_nets_env && strlen(fixed_nets_env) > 0) {
+        std::unordered_set<std::string> fixed_net_names;
+        std::string fixed_nets_str(fixed_nets_env);
+        std::stringstream ss(fixed_nets_str);
+        std::string name;
+        while (std::getline(ss, name, ',')) {
+            if (!name.empty()) fixed_net_names.insert(name);
+        }
+        for (auto net_id : net_list.nets()) {
+            if (fixed_net_names.count(net_list.net_name(net_id))) {
+                fixed_net_ids.insert(size_t(net_id));
+            }
+        }
+        VTR_LOG("VPR_FIXED_NETS: %zu/%zu nets matched for two-phase routing\n",
+                fixed_net_ids.size(), fixed_net_names.size());
+    }
+    bool two_phase_routing = !fixed_net_ids.empty();
 
     IntraLbPbPinLookup intra_lb_pb_pin_lookup(device_ctx.logical_block_types);
     ClusteredPinAtomPinsLookup netlist_pin_lookup(cluster_ctx.clb_nlist, atom_ctx.netlist(), intra_lb_pb_pin_lookup);
@@ -257,12 +282,82 @@ bool route(const Netlist<>& net_list,
 
     int rcv_finished_count = RCV_FINISH_EARLY_COUNTDOWN;
 
+    // === Two-phase routing: Phase 1 — route only fixed nets ===
+    if (two_phase_routing) {
+        VTR_LOG("\n=== PHASE 1: Routing %zu fixed nets ===\n", fixed_net_ids.size());
+
+        // Temporarily mark FREE nets as is_fixed so they're skipped by should_route_net()
+        for (auto net_id : net_list.nets()) {
+            if (fixed_net_ids.find(size_t(net_id)) == fixed_net_ids.end()) {
+                route_ctx.net_status.set_is_fixed(net_id, true);  // skip free nets
+            }
+        }
+
+        float phase1_pres_fac = router_opts.first_iter_pres_fac;
+        OveruseInfo phase1_overuse(device_ctx.rr_graph.num_nodes());
+
+        print_route_status_header();
+        for (int phase1_iter = 1; phase1_iter <= router_opts.max_router_iterations; ++phase1_iter) {
+            // Reset is_routed but preserve is_fixed
+            for (auto net_id : net_list.nets()) {
+                route_ctx.net_status.set_is_routed(net_id, false);
+            }
+
+            netlist_router->set_timing_info(timing_info);
+            RouteIterResults phase1_results = netlist_router->route_netlist(
+                phase1_iter, phase1_pres_fac, 0);
+
+            if (!phase1_results.is_routable) {
+                VTR_LOG("Phase 1: unroutable\n");
+                return false;
+            }
+
+            // Update congestion info
+            if (phase1_iter == 1) {
+                pathfinder_update_acc_cost_and_overuse_info(0., phase1_overuse);
+            } else {
+                pathfinder_update_acc_cost_and_overuse_info(router_opts.acc_fac, phase1_overuse);
+            }
+
+            VTR_LOG("Phase 1 iter %d: %zu overused nodes\n",
+                    phase1_iter, phase1_overuse.overused_nodes);
+
+            if (phase1_overuse.overused_nodes == 0) {
+                VTR_LOG("Phase 1 converged after %d iterations\n", phase1_iter);
+                break;
+            }
+
+            if (phase1_iter >= router_opts.max_router_iterations) {
+                VTR_LOG("Phase 1 failed to converge after %d iterations\n", phase1_iter);
+                return false;
+            }
+
+            // Increase congestion penalty
+            if (phase1_iter == 1) phase1_pres_fac = router_opts.initial_pres_fac;
+            else phase1_pres_fac *= router_opts.pres_fac_mult;
+        }
+
+        // Transition: lock fixed nets, unlock free nets
+        for (auto net_id : net_list.nets()) {
+            if (fixed_net_ids.count(size_t(net_id))) {
+                route_ctx.net_status.set_is_fixed(net_id, true);   // lock fixed nets
+            } else {
+                route_ctx.net_status.set_is_fixed(net_id, false);  // unlock free nets
+            }
+        }
+
+        VTR_LOG("\n=== PHASE 2: Routing remaining nets (fixed nets locked) ===\n");
+    }
+
     print_route_status_header();
     for (itry = 1; itry <= router_opts.max_router_iterations; ++itry) {
         /* Reset "is_routed" and "is_fixed" flags to indicate nets not pre-routed (yet) */
         for (auto net_id : net_list.nets()) {
             route_ctx.net_status.set_is_routed(net_id, false);
-            route_ctx.net_status.set_is_fixed(net_id, false);
+            // Preserve is_fixed for two-phase routing (fixed nets stay locked)
+            if (!two_phase_routing) {
+                route_ctx.net_status.set_is_fixed(net_id, false);
+            }
         }
 
         if (itry_since_last_convergence >= 0) {
