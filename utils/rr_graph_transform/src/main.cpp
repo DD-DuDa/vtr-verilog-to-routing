@@ -875,9 +875,10 @@ bool transform_cerebras(ParsedGraph& g, int gate_layer) {
         push_edge_unique(dedup_edges, seen, e.src, e.sink, e.switch_id);
     }
 
-    // Boundary cleanup: remove edges touching CHANY(x=0) on any layer, or layer-0 CHANX(y=0).
-    // Mirrors the original boundary mode to prevent routing along the left/bottom edge.
-    // This includes gate nodes at x=0 (CHANY(x=0, layer=gate_layer)) — they are removed too.
+    // Boundary cleanup: remove edges touching CHANX(y=0) on layer 0.
+    // CHANY(x=0) is kept on ALL layers so IO pads on the left edge can route into the fabric.
+    // PE traffic cannot bypass gates anyway (R2/R3 enforce OPIN/IPIN through gates),
+    // so keeping CHANY(x=0) only enables IO routing — not PE shortcutting.
     std::vector<EdgeInfo> boundary_cleaned;
     boundary_cleaned.reserve(dedup_edges.size());
     size_t removed_boundary = 0;
@@ -892,11 +893,8 @@ bool transform_cerebras(ParsedGraph& g, int gate_layer) {
         const NodeInfo& sink = sink_it->second;
 
         bool is_boundary = false;
-        if (src.type == "CHANY" && src.xlow == 0 && src.xhigh == 0)
-            is_boundary = true;
-        if (!is_boundary && sink.type == "CHANY" && sink.xlow == 0 && sink.xhigh == 0)
-            is_boundary = true;
-        if (!is_boundary && src.type == "CHANX" && src.layer == 0 && src.ylow == 0 && src.yhigh == 0)
+        // Remove layer-0 CHANX at y=0 (bottom edge)
+        if (src.type == "CHANX" && src.layer == 0 && src.ylow == 0 && src.yhigh == 0)
             is_boundary = true;
         if (!is_boundary && sink.type == "CHANX" && sink.layer == 0 && sink.ylow == 0 && sink.yhigh == 0)
             is_boundary = true;
@@ -924,7 +922,7 @@ bool transform_cerebras(ParsedGraph& g, int gate_layer) {
               << "  removed by strict base exact policy (R8): " << removed_r8_base_exact << "\n"
               << "  removed by strict pin policy (R8): " << removed_r8_pin_exact << "\n"
               << "  removed in global cleanup (R8): " << removed_r8 << "\n"
-              << "  removed boundary CHAN edges (x=0 CHANY any-layer / y=0 CHANX layer-0): " << removed_boundary << "\n"
+              << "  removed boundary CHAN edges (y=0 CHANX layer-0): " << removed_boundary << "\n"
               << "  gate nodes tracked: " << gate_node_ids.size() << "\n"
               << "  edges out: " << boundary_cleaned.size() << "\n";
 
