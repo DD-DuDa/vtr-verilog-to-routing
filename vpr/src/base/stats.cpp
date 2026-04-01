@@ -371,8 +371,12 @@ void get_num_bends_and_length(ParentNetId inet, int* bends_ptr, int* len_ptr, in
 
     const vtr::optional<RouteTree>& tree = route_ctx.route_trees[inet];
     if (!tree) {
-        VPR_FATAL_ERROR(VPR_ERROR_OTHER,
-                        "in get_num_bends_and_length: net #%lu has no routing.\n", size_t(inet));
+        /* Fixed nets in two-phase routing have no VPR routes — return zeros */
+        *bends_ptr = 0;
+        *len_ptr = 0;
+        *segments_ptr = 0;
+        *is_absorbed_ptr = true;
+        return;
     }
 
     e_rr_type prev_type = rr_graph.node_type(tree->root().inode);

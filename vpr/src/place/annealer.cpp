@@ -238,7 +238,8 @@ PlacementAnnealer::PlacementAnnealer(const t_placer_opts& placer_opts,
         first_crit_exponent = 0.f;
     }
 
-    int first_move_lim = get_place_inner_loop_num_move(placer_opts, placer_opts_.anneal_sched);
+    size_t num_movable = placer_state.blk_loc_registry().movable_blocks().size();
+    int first_move_lim = get_place_inner_loop_num_move(placer_opts, placer_opts_.anneal_sched, num_movable);
 
     VTR_LOG("Moves per temperature: %d\n", first_move_lim);
 

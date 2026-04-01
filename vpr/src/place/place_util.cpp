@@ -50,12 +50,19 @@ t_placer_costs& t_placer_costs::operator+=(const NocCostTerms& noc_delta_cost) {
     return *this;
 }
 
-int get_place_inner_loop_num_move(const t_placer_opts& placer_opts, const t_annealing_sched& annealing_sched) {
+int get_place_inner_loop_num_move(const t_placer_opts& placer_opts, const t_annealing_sched& annealing_sched, size_t num_movable_blocks) {
     const auto& device_ctx = g_vpr_ctx.device();
     const auto& cluster_ctx = g_vpr_ctx.clustering();
 
     float device_size = device_ctx.grid.width() * device_ctx.grid.height();
     size_t num_blocks = cluster_ctx.clb_nlist.blocks().size();
+
+    // Use movable block count when available to avoid wasting moves on fixed blocks
+    if (num_movable_blocks > 0 && num_movable_blocks < num_blocks) {
+        VTR_LOG("Scaling move limit by movable blocks: %zu / %zu total\n",
+                num_movable_blocks, num_blocks);
+        num_blocks = num_movable_blocks;
+    }
 
     int move_lim;
     if (placer_opts.effort_scaling == e_place_effort_scaling::CIRCUIT) {

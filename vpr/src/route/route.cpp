@@ -14,6 +14,7 @@
 #include "vtr_time.h"
 
 #include <cstdlib>
+#include <fstream>
 #include <sstream>
 #include <unordered_set>
 
@@ -87,24 +88,44 @@ bool route(const Netlist<>& net_list,
                        router_opts.has_choke_point,
                        is_flat);
 
-    // Parse VPR_FIXED_NETS env var for two-phase routing
+    // Parse fixed nets for two-phase routing (from file or env var)
     std::unordered_set<size_t> fixed_net_ids;
-    const char* fixed_nets_env = std::getenv("VPR_FIXED_NETS");
-    if (fixed_nets_env && strlen(fixed_nets_env) > 0) {
+    {
         std::unordered_set<std::string> fixed_net_names;
-        std::string fixed_nets_str(fixed_nets_env);
-        std::stringstream ss(fixed_nets_str);
-        std::string name;
-        while (std::getline(ss, name, ',')) {
-            if (!name.empty()) fixed_net_names.insert(name);
-        }
-        for (auto net_id : net_list.nets()) {
-            if (fixed_net_names.count(net_list.net_name(net_id))) {
-                fixed_net_ids.insert(size_t(net_id));
+        // Prefer file-based input (avoids "Argument list too long" for large net lists)
+        const char* fixed_nets_file = std::getenv("VPR_FIXED_NETS_FILE");
+        if (fixed_nets_file && strlen(fixed_nets_file) > 0) {
+            std::ifstream infile(fixed_nets_file);
+            if (infile.is_open()) {
+                std::string name;
+                while (std::getline(infile, name)) {
+                    if (!name.empty()) fixed_net_names.insert(name);
+                }
+                infile.close();
+            } else {
+                VTR_LOG("WARNING: Could not open VPR_FIXED_NETS_FILE: %s\n", fixed_nets_file);
+            }
+        } else {
+            // Fallback: parse from env var (for small net lists)
+            const char* fixed_nets_env = std::getenv("VPR_FIXED_NETS");
+            if (fixed_nets_env && strlen(fixed_nets_env) > 0) {
+                std::string fixed_nets_str(fixed_nets_env);
+                std::stringstream ss(fixed_nets_str);
+                std::string name;
+                while (std::getline(ss, name, ',')) {
+                    if (!name.empty()) fixed_net_names.insert(name);
+                }
             }
         }
-        VTR_LOG("VPR_FIXED_NETS: %zu/%zu nets matched for two-phase routing\n",
-                fixed_net_ids.size(), fixed_net_names.size());
+        if (!fixed_net_names.empty()) {
+            for (auto net_id : net_list.nets()) {
+                if (fixed_net_names.count(net_list.net_name(net_id))) {
+                    fixed_net_ids.insert(size_t(net_id));
+                }
+            }
+            VTR_LOG("VPR_FIXED_NETS: %zu/%zu nets matched for two-phase routing\n",
+                    fixed_net_ids.size(), fixed_net_names.size());
+        }
     }
     bool two_phase_routing = !fixed_net_ids.empty();
 
@@ -282,79 +303,35 @@ bool route(const Netlist<>& net_list,
 
     int rcv_finished_count = RCV_FINISH_EARLY_COUNTDOWN;
 
-    // === Two-phase routing: Phase 1 — route only fixed nets ===
+    // === Two-phase routing: Skip Phase 1, mark fixed nets as done ===
+    // Fixed nets get deterministic routes from K-tree pattern in Python,
+    // not from VPR. We just mark them so VPR skips them in Phase 2.
     if (two_phase_routing) {
-        VTR_LOG("\n=== PHASE 1: Routing %zu fixed nets ===\n", fixed_net_ids.size());
+        VTR_LOG("\n=== Skipping Phase 1: Marking %zu fixed nets as routed ===\n",
+                fixed_net_ids.size());
 
-        // Temporarily mark FREE nets as is_fixed so they're skipped by should_route_net()
-        for (auto net_id : net_list.nets()) {
-            if (fixed_net_ids.find(size_t(net_id)) == fixed_net_ids.end()) {
-                route_ctx.net_status.set_is_fixed(net_id, true);  // skip free nets
-            }
-        }
-
-        float phase1_pres_fac = router_opts.first_iter_pres_fac;
-        OveruseInfo phase1_overuse(device_ctx.rr_graph.num_nodes());
-
-        print_route_status_header();
-        for (int phase1_iter = 1; phase1_iter <= router_opts.max_router_iterations; ++phase1_iter) {
-            // Reset is_routed but preserve is_fixed
-            for (auto net_id : net_list.nets()) {
-                route_ctx.net_status.set_is_routed(net_id, false);
-            }
-
-            netlist_router->set_timing_info(timing_info);
-            RouteIterResults phase1_results = netlist_router->route_netlist(
-                phase1_iter, phase1_pres_fac, 0);
-
-            if (!phase1_results.is_routable) {
-                VTR_LOG("Phase 1: unroutable\n");
-                return false;
-            }
-
-            // Update congestion info
-            if (phase1_iter == 1) {
-                pathfinder_update_acc_cost_and_overuse_info(0., phase1_overuse);
-            } else {
-                pathfinder_update_acc_cost_and_overuse_info(router_opts.acc_fac, phase1_overuse);
-            }
-
-            VTR_LOG("Phase 1 iter %d: %zu overused nodes\n",
-                    phase1_iter, phase1_overuse.overused_nodes);
-
-            if (phase1_overuse.overused_nodes == 0) {
-                VTR_LOG("Phase 1 converged after %d iterations\n", phase1_iter);
-                break;
-            }
-
-            if (phase1_iter >= router_opts.max_router_iterations) {
-                VTR_LOG("Phase 1 failed to converge after %d iterations\n", phase1_iter);
-                return false;
-            }
-
-            // Increase congestion penalty
-            if (phase1_iter == 1) phase1_pres_fac = router_opts.initial_pres_fac;
-            else phase1_pres_fac *= router_opts.pres_fac_mult;
-        }
-
-        // Transition: lock fixed nets, unlock free nets
+        // Mark fixed nets as is_fixed + is_routed (no actual routing)
         for (auto net_id : net_list.nets()) {
             if (fixed_net_ids.count(size_t(net_id))) {
-                route_ctx.net_status.set_is_fixed(net_id, true);   // lock fixed nets
-            } else {
-                route_ctx.net_status.set_is_fixed(net_id, false);  // unlock free nets
+                route_ctx.net_status.set_is_fixed(net_id, true);
+                route_ctx.net_status.set_is_routed(net_id, true);
             }
         }
 
-        VTR_LOG("\n=== PHASE 2: Routing remaining nets (fixed nets locked) ===\n");
+        VTR_LOG("\n=== PHASE 2: Routing %zu free nets ===\n",
+                net_list.nets().size() - fixed_net_ids.size());
     }
 
     print_route_status_header();
     for (itry = 1; itry <= router_opts.max_router_iterations; ++itry) {
         /* Reset "is_routed" and "is_fixed" flags to indicate nets not pre-routed (yet) */
         for (auto net_id : net_list.nets()) {
+            // Preserve is_fixed and is_routed for fixed nets in two-phase routing
+            // (fixed nets have no VPR routes — they stay marked as routed)
+            if (two_phase_routing && fixed_net_ids.count(size_t(net_id))) {
+                continue;
+            }
             route_ctx.net_status.set_is_routed(net_id, false);
-            // Preserve is_fixed for two-phase routing (fixed nets stay locked)
             if (!two_phase_routing) {
                 route_ctx.net_status.set_is_fixed(net_id, false);
             }

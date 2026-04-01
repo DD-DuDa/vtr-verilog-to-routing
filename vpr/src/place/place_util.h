@@ -205,7 +205,7 @@ class t_placer_statistics {
  * (device_size >> num_blocks), the search space is larger, so the second method
  * performs more moves to ensure better optimization.
  */
-int get_place_inner_loop_num_move(const t_placer_opts& placer_opts, const t_annealing_sched& annealing_sched);
+int get_place_inner_loop_num_move(const t_placer_opts& placer_opts, const t_annealing_sched& annealing_sched, size_t num_movable_blocks = 0);
 
 /**
  * @brief Returns the standard deviation of data set x.

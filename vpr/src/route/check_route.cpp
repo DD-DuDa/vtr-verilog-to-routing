@@ -138,6 +138,10 @@ void check_route(const Netlist<>& net_list,
         if (net_list.net_is_ignored(net_id) || net_list.net_sinks(net_id).size() == 0) /* Skip ignored nets. */
             continue;
 
+        /* Skip fixed nets in two-phase routing (they have no VPR routes) */
+        if (route_ctx.net_status.is_fixed(net_id))
+            continue;
+
         std::fill_n(pin_done.get(), net_list.net_pins(net_id).size(), false);
 
         if (!route_ctx.route_trees[net_id]) {
