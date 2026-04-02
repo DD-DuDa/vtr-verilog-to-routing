@@ -774,13 +774,26 @@ void cerebras_transform_rr_graph(
             VTR_LOG("\n");
         }
 
+        // Optional: remove ALL edges in deep interior fixed region
+        bool remove_interior_rr = false;
+        int interior_buffer = 2;
+        const char* rir_env = std::getenv("VPR_REMOVE_INTERIOR_RR");
+        if (rir_env && std::strcmp(rir_env, "1") == 0) {
+            remove_interior_rr = true;
+            const char* buf_env = std::getenv("VPR_INTERIOR_RR_BUFFER");
+            if (buf_env) interior_buffer = std::atoi(buf_env);
+            if (interior_buffer < 0) interior_buffer = 0;
+            VTR_LOG("  remove_interior_rr: enabled (buffer=%d)\n", interior_buffer);
+        }
+
         reserved_cleaned.reserve(boundary_cleaned.size());
         for (const auto& e : boundary_cleaned) {
             size_t si = size_t(e.src);
             size_t di = size_t(e.dest);
 
-            // Boundary-aware track reservation:
-            //   Interior:        remove all CHANX/CHANY tracks 1-10
+            // Track reservation with optional deep-interior removal:
+            //   Deep interior:  remove ALL CHANX/CHANY (when remove_interior_rr)
+            //   Buffer zone:    remove tracks 1-10 only (normal reservation)
             //   Boundary column: CHANX keep boundary_kept_x, CHANY keep all
             //   Boundary row:    CHANY keep boundary_kept_y, CHANX keep all
             //   Corner:          CHANX remove all, CHANY keep all
@@ -789,7 +802,6 @@ void cerebras_transform_rr_graph(
                 const NodeProps& n = node_cache[idx];
                 if (n.layer != 0) return false;
                 if (n.type != e_rr_type::CHANX && n.type != e_rr_type::CHANY) return false;
-                if (n.ptc < reserved_track_min || n.ptc > reserved_track_max) return false;
 
                 bool in_x_interior = (1 <= n.xlow && n.xlow <= fixed_region_size);
                 bool in_x_boundary = (n.xlow == x_boundary);
@@ -798,6 +810,19 @@ void cerebras_transform_rr_graph(
 
                 if (!(in_x_interior || in_x_boundary)) return false;
                 if (!(in_y_interior || in_y_boundary)) return false;
+
+                // Deep interior: remove ALL tracks (not just reserved range)
+                // Buffer zone near boundary keeps normal behavior
+                if (remove_interior_rr && in_x_interior && in_y_interior) {
+                    bool in_x_buffer = (n.xlow > fixed_region_size - interior_buffer);
+                    bool in_y_buffer = (n.ylow < y_boundary_low + 1 + interior_buffer);
+                    if (!in_x_buffer && !in_y_buffer) {
+                        return true;
+                    }
+                }
+
+                // Buffer zone + boundary: only remove reserved track range
+                if (n.ptc < reserved_track_min || n.ptc > reserved_track_max) return false;
 
                 // Without boundary tracks info, fall back to blanket removal
                 if (!has_boundary_tracks) return true;
@@ -822,7 +847,7 @@ void cerebras_transform_rr_graph(
                     return boundary_kept_y.find(n.ptc) == boundary_kept_y.end();
                 }
 
-                // Interior: remove all reserved tracks
+                // Interior (within buffer): remove reserved tracks only
                 return true;
             };
 
