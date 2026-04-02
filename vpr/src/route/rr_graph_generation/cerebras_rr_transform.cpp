@@ -13,6 +13,7 @@
 #include "vtr_time.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -749,23 +750,83 @@ void cerebras_transform_rr_graph(
         int x_boundary = fixed_region_size + 1;
         int y_boundary_low = fabric_h - fixed_region_size;
 
+        // Parse boundary kept tracks from env vars
+        std::unordered_set<int> boundary_kept_x, boundary_kept_y;
+        auto parse_csv_ints = [](const char* csv, std::unordered_set<int>& out) {
+            if (!csv) return;
+            std::string s(csv);
+            size_t pos = 0;
+            while ((pos = s.find(',')) != std::string::npos) {
+                out.insert(std::atoi(s.substr(0, pos).c_str()));
+                s.erase(0, pos + 1);
+            }
+            if (!s.empty()) out.insert(std::atoi(s.c_str()));
+        };
+        parse_csv_ints(std::getenv("VPR_BOUNDARY_KEPT_TRACKS_X"), boundary_kept_x);
+        parse_csv_ints(std::getenv("VPR_BOUNDARY_KEPT_TRACKS_Y"), boundary_kept_y);
+
+        bool has_boundary_tracks = !boundary_kept_x.empty() || !boundary_kept_y.empty();
+        if (has_boundary_tracks) {
+            VTR_LOG("  boundary kept tracks X:");
+            for (int t : boundary_kept_x) VTR_LOG(" %d", t);
+            VTR_LOG(", Y:");
+            for (int t : boundary_kept_y) VTR_LOG(" %d", t);
+            VTR_LOG("\n");
+        }
+
         reserved_cleaned.reserve(boundary_cleaned.size());
         for (const auto& e : boundary_cleaned) {
             size_t si = size_t(e.src);
             size_t di = size_t(e.dest);
 
-            auto in_reserved_region = [&](size_t idx) -> bool {
+            // Boundary-aware track reservation:
+            //   Interior:        remove all CHANX/CHANY tracks 1-10
+            //   Boundary column: CHANX keep boundary_kept_x, CHANY keep all
+            //   Boundary row:    CHANY keep boundary_kept_y, CHANX keep all
+            //   Corner:          CHANX remove all, CHANY keep all
+            auto should_remove_reserved = [&](size_t idx) -> bool {
                 if (idx >= node_cache.size()) return false;
                 const NodeProps& n = node_cache[idx];
                 if (n.layer != 0) return false;
                 if (n.type != e_rr_type::CHANX && n.type != e_rr_type::CHANY) return false;
                 if (n.ptc < reserved_track_min || n.ptc > reserved_track_max) return false;
-                // Check if in fixed region (VPR coords)
-                return (1 <= n.xlow && n.xlow <= x_boundary
-                        && y_boundary_low <= n.ylow && n.ylow <= fabric_h);
+
+                bool in_x_interior = (1 <= n.xlow && n.xlow <= fixed_region_size);
+                bool in_x_boundary = (n.xlow == x_boundary);
+                bool in_y_interior = (y_boundary_low + 1 <= n.ylow && n.ylow <= fabric_h);
+                bool in_y_boundary = (n.ylow == y_boundary_low);
+
+                if (!(in_x_interior || in_x_boundary)) return false;
+                if (!(in_y_interior || in_y_boundary)) return false;
+
+                // Without boundary tracks info, fall back to blanket removal
+                if (!has_boundary_tracks) return true;
+
+                // Corner (x=boundary, y=boundary): no fixed PEs here
+                //   CHANX: remove all, CHANY: keep all
+                if (in_x_boundary && in_y_boundary) {
+                    return (n.type == e_rr_type::CHANX);
+                }
+
+                // Boundary column (x=boundary, y=interior): x-axis traffic crosses
+                //   CHANX: keep boundary_kept_x only, CHANY: keep all
+                if (in_x_boundary) {
+                    if (n.type == e_rr_type::CHANY) return false;
+                    return boundary_kept_x.find(n.ptc) == boundary_kept_x.end();
+                }
+
+                // Boundary row (y=boundary, x=interior): y-axis traffic crosses
+                //   CHANY: keep boundary_kept_y only, CHANX: keep all
+                if (in_y_boundary) {
+                    if (n.type == e_rr_type::CHANX) return false;
+                    return boundary_kept_y.find(n.ptc) == boundary_kept_y.end();
+                }
+
+                // Interior: remove all reserved tracks
+                return true;
             };
 
-            if (in_reserved_region(si) || in_reserved_region(di)) {
+            if (should_remove_reserved(si) || should_remove_reserved(di)) {
                 removed_reserved++;
             } else {
                 reserved_cleaned.push_back(e);
