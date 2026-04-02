@@ -608,6 +608,29 @@ class t_rr_graph_storage {
         is_tileable_ = false;
     }
 
+    /** @brief Clear only edge data, keeping all nodes intact.
+     * Used by in-memory RR graph transforms that filter/rebuild edges
+     * without changing the node set. Resets edge state flags so new
+     * edges can be added via emplace_back_edge().
+     */
+    void clear_edges_only() {
+        edge_src_node_.clear();
+        edge_dest_node_.clear();
+        edge_switch_.clear();
+        edge_remapped_.clear();
+        edges_read_ = false;
+        partitioned_ = false;
+        remapped_edges_ = false;
+    }
+
+    /** @brief Number of edges before partition_edges() is called.
+     * Valid at any time; after partition the count is the same but
+     * the arrays are sorted by source node.
+     */
+    size_t num_edges_pre_partition() const {
+        return edge_src_node_.size();
+    }
+
     /** @brief
      * Clear the data structures that are mainly used during RR graph construction.
      * After RR Graph is build, we no longer need these data structures.

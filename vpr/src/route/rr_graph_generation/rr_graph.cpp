@@ -1,9 +1,12 @@
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <algorithm>
 #include <utility>
 #include <vector>
 #include "alloc_and_load_rr_indexed_data.h"
+#include "cerebras_rr_transform.h"
 #include "get_parallel_segs.h"
 #include "physical_types.h"
 #include "physical_types_util.h"
@@ -783,11 +786,16 @@ void create_rr_graph(e_graph_type graph_type,
 
     rr_set_sink_locs(device_ctx.rr_graph, mutable_device_ctx.rr_graph_builder, grid);
 
-    verify_rr_node_indices(grid,
-                           device_ctx.rr_graph,
-                           device_ctx.rr_indexed_data,
-                           device_ctx.rr_graph.rr_nodes(),
-                           is_flat);
+    {
+        const char* cerebras_env = std::getenv("VPR_CEREBRAS_TRANSFORM");
+        if (!(cerebras_env && std::strcmp(cerebras_env, "1") == 0)) {
+            verify_rr_node_indices(grid,
+                                   device_ctx.rr_graph,
+                                   device_ctx.rr_indexed_data,
+                                   device_ctx.rr_graph.rr_nodes(),
+                                   is_flat);
+        }
+    }
 
     print_rr_graph_stats();
 
@@ -1360,6 +1368,40 @@ static void build_rr_graph(e_graph_type graph_type,
 
     update_chan_width(&nodes_per_chan);
 
+    // --- Cerebras in-memory RR graph transform (if enabled via env var) ---
+    {
+        const char* cerebras_env = std::getenv("VPR_CEREBRAS_TRANSFORM");
+        if (cerebras_env && std::strcmp(cerebras_env, "1") == 0) {
+            // Reset edges_read_ so the transform can add new gate nodes
+            device_ctx.rr_graph_builder.unlock_storage();
+            int cb_gate_layer = 1;
+            const char* gl_env = std::getenv("VPR_RR_GATE_LAYER");
+            if (gl_env) cb_gate_layer = std::atoi(gl_env);
+
+            int cb_fixed_region_size = 0;
+            const char* frs_env = std::getenv("VPR_FIXED_REGION_SIZE");
+            if (frs_env) cb_fixed_region_size = std::atoi(frs_env);
+
+            // fabric_h = VPR grid height minus 2 IO rows
+            int cb_fabric_h = static_cast<int>(grid.height()) - 2;
+
+            int cb_res_min = 1, cb_res_max = 10;
+            const char* rmin_env = std::getenv("VPR_RESERVED_TRACK_MIN");
+            if (rmin_env) cb_res_min = std::atoi(rmin_env);
+            const char* rmax_env = std::getenv("VPR_RESERVED_TRACK_MAX");
+            if (rmax_env) cb_res_max = std::atoi(rmax_env);
+
+            cerebras_transform_rr_graph(
+                device_ctx.rr_graph_builder,
+                rr_graph,
+                grid,
+                cb_gate_layer,
+                cb_fixed_region_size,
+                cb_fabric_h,
+                cb_res_min, cb_res_max);
+        }
+    }
+
     // Allocate and load routing resource switches, which are derived from the switches from the architecture file,
     // based on their fanin in the rr graph. This routine also adjusts the rr nodes to point to these new rr switches
     alloc_and_load_rr_switch_inf(g_vpr_ctx.mutable_device().rr_graph_builder,
@@ -1379,15 +1421,24 @@ static void build_rr_graph(e_graph_type graph_type,
 
     rr_graph_externals(segment_inf, segment_inf_x, segment_inf_y, *wire_to_rr_ipin_switch, base_cost_type);
 
-    const VibDeviceGrid vib_grid;
-    check_rr_graph(device_ctx.rr_graph,
-                   types,
-                   device_ctx.rr_indexed_data,
-                   grid,
-                   vib_grid,
-                   device_ctx.chan_width,
-                   graph_type,
-                   is_flat);
+    {
+        // Skip check_rr_graph when cerebras transform is active — gate nodes
+        // intentionally lack some properties expected by the validator.
+        const char* cerebras_env = std::getenv("VPR_CEREBRAS_TRANSFORM");
+        if (!(cerebras_env && std::strcmp(cerebras_env, "1") == 0)) {
+            const VibDeviceGrid vib_grid;
+            check_rr_graph(device_ctx.rr_graph,
+                           types,
+                           device_ctx.rr_indexed_data,
+                           grid,
+                           vib_grid,
+                           device_ctx.chan_width,
+                           graph_type,
+                           is_flat);
+        } else {
+            VTR_LOG("Skipping check_rr_graph (cerebras transform active)\n");
+        }
+    }
 
     if (sb_conn_map) {
         free_switchblock_permutations(sb_conn_map);

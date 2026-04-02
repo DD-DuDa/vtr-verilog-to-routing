@@ -342,6 +342,17 @@ class RRGraphBuilder {
     inline void emplace_back_edge(RRNodeId src, RRNodeId dest, short edge_switch, bool remapped) {
         node_storage_.emplace_back_edge(src, dest, edge_switch, remapped);
     }
+    /** @brief Clear only edge data, keeping all nodes intact.
+     * Used by in-memory RR graph transforms. */
+    inline void clear_edges_only() {
+        node_storage_.clear_edges_only();
+    }
+
+    /** @brief Number of edges before partition_edges(). */
+    inline size_t num_edges_pre_partition() const {
+        return node_storage_.num_edges_pre_partition();
+    }
+
     /** @brief Append 1 more RR node to the RR graph. */
     inline void emplace_back() {
         // No edges can be assigned if mutating the rr node array.
