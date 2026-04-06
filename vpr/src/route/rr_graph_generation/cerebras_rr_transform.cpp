@@ -747,8 +747,24 @@ void cerebras_transform_rr_graph(
     size_t removed_reserved = 0;
 
     if (fixed_region_size > 0 && reserved_track_min <= reserved_track_max) {
-        int x_boundary = fixed_region_size + 1;
-        int y_boundary_low = fabric_h - fixed_region_size;
+        // Default: top-left corner (x starts at 1, y starts at fabric_h - size + 1)
+        int fixed_x_start = 1;
+        int fixed_y_start = fabric_h - fixed_region_size + 1;
+
+        // Custom position from env vars
+        const char* fxs_env = std::getenv("VPR_FIXED_REGION_X_START");
+        if (fxs_env) fixed_x_start = std::atoi(fxs_env);
+        const char* fys_env = std::getenv("VPR_FIXED_REGION_Y_START");
+        if (fys_env) fixed_y_start = std::atoi(fys_env);
+
+        int x_boundary = fixed_x_start + fixed_region_size;  // one col beyond
+        int y_boundary_low = fixed_y_start - 1;  // one row below
+        int y_boundary_high = fixed_y_start + fixed_region_size - 1;  // top of fixed region
+
+        VTR_LOG("  fixed region: x=[%d,%d] y=[%d,%d], boundary: x_boundary=%d, y_low=%d, y_high=%d\n",
+                fixed_x_start, fixed_x_start + fixed_region_size - 1,
+                fixed_y_start, y_boundary_high,
+                x_boundary, y_boundary_low, y_boundary_high + 1);
 
         // Parse boundary kept tracks from env vars
         std::unordered_set<int> boundary_kept_x, boundary_kept_y;
@@ -803,10 +819,12 @@ void cerebras_transform_rr_graph(
                 if (n.layer != 0) return false;
                 if (n.type != e_rr_type::CHANX && n.type != e_rr_type::CHANY) return false;
 
-                bool in_x_interior = (1 <= n.xlow && n.xlow <= fixed_region_size);
+                bool in_x_interior = (fixed_x_start <= n.xlow && n.xlow <= fixed_x_start + fixed_region_size - 1);
                 bool in_x_boundary = (n.xlow == x_boundary);
-                bool in_y_interior = (y_boundary_low + 1 <= n.ylow && n.ylow <= fabric_h);
-                bool in_y_boundary = (n.ylow == y_boundary_low);
+                bool in_y_interior = (fixed_y_start <= n.ylow && n.ylow <= y_boundary_high);
+                bool in_y_boundary_low = (n.ylow == y_boundary_low);
+                bool in_y_boundary_high = (n.ylow == y_boundary_high + 1);
+                bool in_y_boundary = in_y_boundary_low || in_y_boundary_high;
 
                 if (!(in_x_interior || in_x_boundary)) return false;
                 if (!(in_y_interior || in_y_boundary)) return false;
@@ -814,8 +832,8 @@ void cerebras_transform_rr_graph(
                 // Deep interior: remove ALL tracks (not just reserved range)
                 // Buffer zone near boundary keeps normal behavior
                 if (remove_interior_rr && in_x_interior && in_y_interior) {
-                    bool in_x_buffer = (n.xlow > fixed_region_size - interior_buffer);
-                    bool in_y_buffer = (n.ylow < y_boundary_low + 1 + interior_buffer);
+                    bool in_x_buffer = (n.xlow > fixed_x_start + fixed_region_size - 1 - interior_buffer);
+                    bool in_y_buffer = (n.ylow < fixed_y_start + interior_buffer);
                     if (!in_x_buffer && !in_y_buffer) {
                         return true;
                     }
@@ -833,11 +851,12 @@ void cerebras_transform_rr_graph(
                     return (n.type == e_rr_type::CHANX);
                 }
 
-                // Boundary column (x=boundary, y=interior): x-axis traffic crosses
-                //   CHANX: keep boundary_kept_x only, CHANY: keep all
+                // Boundary column (x=boundary, y=interior): reserve tracks 1-5
+                //   same as interior — remove reserved tracks for both CHANX and CHANY
+                //   (boundary_kept_x is computed but not used here to avoid
+                //    free PE nets routing on tracks reserved for fixed-region comm)
                 if (in_x_boundary) {
-                    if (n.type == e_rr_type::CHANY) return false;
-                    return boundary_kept_x.find(n.ptc) == boundary_kept_x.end();
+                    return true;
                 }
 
                 // Boundary row (y=boundary, x=interior): y-axis traffic crosses
