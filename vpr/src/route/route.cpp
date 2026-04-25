@@ -129,6 +129,47 @@ bool route(const Netlist<>& net_list,
     }
     bool two_phase_routing = !fixed_net_ids.empty();
 
+    // Parse phase-1 heuristic net set (from file) when VPR_HEURISTIC_PHASE1=1.
+    // These nets (typically intra-op bcast/reduce nets of the ILP-bottleneck op)
+    // get routed first, before any other net, with no track forcing. After phase 1
+    // they are marked is_fixed=true so subsequent routing negotiates around them
+    // via the standard pathfinder occupancy mechanism (soft mask).
+    std::unordered_set<size_t> phase1_net_ids;
+    bool phase1_routing_enabled = false;
+    {
+        const char* p1_env = std::getenv("VPR_HEURISTIC_PHASE1");
+        if (p1_env && std::atoi(p1_env) > 0) {
+            std::unordered_set<std::string> phase1_names;
+            const char* p1_file = std::getenv("VPR_PHASE1_NETS_FILE");
+            if (p1_file && strlen(p1_file) > 0) {
+                std::ifstream infile(p1_file);
+                if (infile.is_open()) {
+                    std::string name;
+                    while (std::getline(infile, name)) {
+                        if (!name.empty()) phase1_names.insert(name);
+                    }
+                    infile.close();
+                } else {
+                    VTR_LOG("WARNING: VPR_HEURISTIC_PHASE1=1 but cannot open "
+                            "VPR_PHASE1_NETS_FILE: %s\n", p1_file);
+                }
+            } else {
+                VTR_LOG("WARNING: VPR_HEURISTIC_PHASE1=1 but VPR_PHASE1_NETS_FILE "
+                        "is not set — phase-1 routing disabled\n");
+            }
+            if (!phase1_names.empty()) {
+                for (auto net_id : net_list.nets()) {
+                    if (phase1_names.count(net_list.net_name(net_id))) {
+                        phase1_net_ids.insert(size_t(net_id));
+                    }
+                }
+                phase1_routing_enabled = !phase1_net_ids.empty();
+                VTR_LOG("VPR_HEURISTIC_PHASE1: %zu/%zu phase-1 nets matched\n",
+                        phase1_net_ids.size(), phase1_names.size());
+            }
+        }
+    }
+
     IntraLbPbPinLookup intra_lb_pb_pin_lookup(device_ctx.logical_block_types);
     ClusteredPinAtomPinsLookup netlist_pin_lookup(cluster_ctx.clb_nlist, atom_ctx.netlist(), intra_lb_pb_pin_lookup);
 
@@ -322,6 +363,75 @@ bool route(const Netlist<>& net_list,
                 net_list.nets().size() - fixed_net_ids.size());
     }
 
+    // === Heuristic phase-1 routing ===
+    // Route the configured subset of nets (e.g. intra-op bcast/reduce of the
+    // bottleneck op) before the main pathfinder loop. Uses standard VPR
+    // routing on an empty fabric; on convergence the routes are locked via
+    // is_fixed=true and their RR-node occupancy enters the pathfinder state
+    // naturally so phase 2 negotiates around them (soft mask).
+    if (phase1_routing_enabled) {
+        int p1_max_iter = std::max(50, router_opts.max_router_iterations / 4);
+        p1_max_iter = std::min(p1_max_iter, std::max(1, router_opts.max_router_iterations / 2));
+        VTR_LOG("\n=== HEURISTIC PHASE 1: routing %zu nets (max %d iters) ===\n",
+                phase1_net_ids.size(), p1_max_iter);
+
+        float p1_pres_fac = router_opts.first_iter_pres_fac;
+        bool p1_converged = false;
+        for (int p1_itry = 1; p1_itry <= p1_max_iter; ++p1_itry) {
+            // Reset is_routed for phase-1 nets so should_route_net re-evaluates them
+            for (auto nid : phase1_net_ids) {
+                route_ctx.net_status.set_is_routed(ParentNetId(nid), false);
+            }
+
+            RouteIterResults p1_results = netlist_router->route_netlist_subset(
+                p1_itry, p1_pres_fac, 0.0f, phase1_net_ids);
+
+            if (!p1_results.is_routable) {
+                VTR_LOG("ERROR: Phase-1 heuristic routing hit unroutable net at iter %d\n",
+                        p1_itry);
+                return false;
+            }
+
+            // Update per-node cost state based on current phase-1 occupancy
+            if (p1_itry == 1) {
+                pathfinder_update_acc_cost_and_overuse_info(0., overuse_info);
+            } else {
+                pathfinder_update_acc_cost_and_overuse_info(router_opts.acc_fac, overuse_info);
+            }
+
+            VTR_LOG("  Phase-1 iter %d: pres_fac=%.2f, overused_nodes=%zu\n",
+                    p1_itry, p1_pres_fac, overuse_info.overused_nodes);
+
+            if (overuse_info.overused_nodes == 0) {
+                VTR_LOG("  Phase-1 converged after %d iter(s)\n", p1_itry);
+                p1_converged = true;
+                break;
+            }
+
+            p1_pres_fac *= router_opts.pres_fac_mult;
+            p1_pres_fac = std::min(p1_pres_fac, router_opts.max_pres_fac);
+        }
+
+        if (!p1_converged) {
+            VTR_LOG("WARNING: Phase-1 heuristic routing did not fully converge within %d iters; "
+                    "%zu overused nodes remain. Proceeding to phase 2 anyway.\n",
+                    p1_max_iter, overuse_info.overused_nodes);
+        }
+
+        // Lock phase-1 routes so the main loop skips them via should_route_net
+        for (auto nid : phase1_net_ids) {
+            ParentNetId pnid(nid);
+            route_ctx.net_status.set_is_fixed(pnid, true);
+            route_ctx.net_status.set_is_routed(pnid, true);
+        }
+        VTR_LOG("=== HEURISTIC PHASE 1 complete: %zu nets locked; entering main loop ===\n\n",
+                phase1_net_ids.size());
+
+        // Reset pres_fac for phase 2 — phase 1 may have escalated it.
+        pres_fac = router_opts.first_iter_pres_fac;
+        update_draw_pres_fac(pres_fac);
+    }
+
     print_route_status_header();
     for (itry = 1; itry <= router_opts.max_router_iterations; ++itry) {
         /* Reset "is_routed" and "is_fixed" flags to indicate nets not pre-routed (yet) */
@@ -331,8 +441,13 @@ bool route(const Netlist<>& net_list,
             if (two_phase_routing && fixed_net_ids.count(size_t(net_id))) {
                 continue;
             }
+            // Preserve is_fixed + is_routed for phase-1 heuristic nets so the
+            // main loop never rip-ups them via should_route_net.
+            if (phase1_routing_enabled && phase1_net_ids.count(size_t(net_id))) {
+                continue;
+            }
             route_ctx.net_status.set_is_routed(net_id, false);
-            if (!two_phase_routing) {
+            if (!two_phase_routing && !phase1_routing_enabled) {
                 route_ctx.net_status.set_is_fixed(net_id, false);
             }
         }

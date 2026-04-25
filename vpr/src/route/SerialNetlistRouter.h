@@ -39,6 +39,8 @@ class SerialNetlistRouter : public NetlistRouter {
     ~SerialNetlistRouter() {}
 
     RouteIterResults route_netlist(int itry, float pres_fac, float worst_neg_slack);
+    RouteIterResults route_netlist_subset(int itry, float pres_fac, float worst_neg_slack,
+                                           const std::unordered_set<size_t>& subset_net_ids) override;
     void handle_bb_updated_nets(const std::vector<ParentNetId>& nets);
     void set_rcv_enabled(bool x);
     void set_timing_info(std::shared_ptr<SetupHoldTimingInfo> timing_info);

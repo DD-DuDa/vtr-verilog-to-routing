@@ -14,6 +14,7 @@
  * NetlistRouter-derived class is still a NetlistRouter, so that is transparent to the user
  * of this interface. */
 
+#include <unordered_set>
 #include <vector>
 #include "NetPinTimingInvalidator.h"
 #include "clustered_netlist_utils.h"
@@ -52,6 +53,18 @@ class NetlistRouter {
      * route_net for each net, which will handle other global updates.
      * \return RouteIterResults for this iteration. */
     virtual RouteIterResults route_netlist(int itry, float pres_fac, float worst_neg_slack) = 0;
+
+    /** Run a single iteration of netlist routing restricted to a subset of nets.
+     * Used for phase-1 heuristic routing in route.cpp. Default implementation fatals;
+     * only SerialNetlistRouter currently supports this. */
+    virtual RouteIterResults route_netlist_subset(int /*itry*/, float /*pres_fac*/,
+                                                   float /*worst_neg_slack*/,
+                                                   const std::unordered_set<size_t>& /*subset_net_ids*/) {
+        VPR_FATAL_ERROR(VPR_ERROR_ROUTE,
+                        "route_netlist_subset is only supported by SerialNetlistRouter; "
+                        "use --router_algorithm timing_driven (the default) with VPR_HEURISTIC_PHASE1=1");
+        return RouteIterResults{};
+    }
 
     /** Handle net bounding box updates by passing them to the PartitionTree.
      * No-op for the serial router */
